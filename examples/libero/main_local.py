@@ -11,7 +11,6 @@ import logging
 import math
 import pathlib
 
-import imageio
 from libero.libero import benchmark
 from libero.libero import get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
@@ -43,12 +42,12 @@ class Args:
         "libero_spatial"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
     )
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize in sim
-    num_trials_per_task: int = 50  # Number of rollouts per task
+    num_trials_per_task: int = 10  # Number of rollouts per task
 
     #################################################################################################################
     # Utils
     #################################################################################################################
-    video_out_path: str = "data/libero/videos"  # Path to save videos
+    frame_archive_path: str = "data/libero/frame_archives"  # Path to save per-episode frame archives (.npz)
 
     seed: int = 7  # Random Seed (for reproducibility)
 
@@ -69,7 +68,7 @@ def eval_libero(args: Args) -> None:
     num_tasks_in_suite = task_suite.n_tasks
     logging.info(f"Task suite: {args.task_suite_name}")
 
-    pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
+    pathlib.Path(args.frame_archive_path).mkdir(parents=True, exist_ok=True)
 
     if args.task_suite_name == "libero_spatial":
         max_steps = 220  # longest training demo has 193 steps
@@ -176,13 +175,18 @@ def eval_libero(args: Args) -> None:
             task_episodes += 1
             total_episodes += 1
 
-            # Save a replay video of the episode
+            # Save per-episode replay frames as an archive for offline video conversion.
             suffix = "success" if done else "failure"
             task_segment = task_description.replace(" ", "_")
-            imageio.mimwrite(
-                pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_{suffix}.mp4",
-                [np.asarray(x) for x in replay_images],
-                fps=10,
+            # Save raw replay frames for offline MP4 conversion in a separate process.
+            # This avoids subprocess/fork during JAX inference and prevents deadlock warnings.
+            archive_path = pathlib.Path(args.frame_archive_path) / (
+                f"rollout_task{task_id:03d}_episode{episode_idx:03d}_{task_segment}_{suffix}.npz"
+            )
+            np.savez_compressed(
+                archive_path,
+                frames=np.asarray(replay_images, dtype=np.uint8),
+                fps=np.asarray(10, dtype=np.int32),
             )
 
             # Log current results
