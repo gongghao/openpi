@@ -33,7 +33,14 @@ def main(args: Args) -> None:
         return
 
     logging.info("Converting %d archives from %s", len(archives), archive_dir)
+    num_success = 0
+    num_failure = 0
     for archive_path in tqdm.tqdm(archives):
+        if archive_path.stem.endswith("_success"):
+            num_success += 1
+        elif archive_path.stem.endswith("_failure"):
+            num_failure += 1
+
         out_path = video_dir / f"{archive_path.stem}.mp4"
         if out_path.exists() and not args.overwrite:
             continue
@@ -44,7 +51,16 @@ def main(args: Args) -> None:
 
         imageio.mimwrite(out_path, [np.asarray(frame) for frame in frames], fps=fps)
 
+    total = num_success + num_failure
+    success_rate = (num_success / total * 100.0) if total > 0 else 0.0
     logging.info("Done. MP4 videos saved to %s", video_dir)
+    logging.info(
+        "Evaluation summary from archives: success=%d, failure=%d, total=%d, success_rate=%.2f%%",
+        num_success,
+        num_failure,
+        total,
+        success_rate,
+    )
 
 
 if __name__ == "__main__":
