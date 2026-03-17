@@ -67,6 +67,9 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.flow_noise_enabled = config.flow_noise_enabled
+        self.flow_noise_std_min = config.flow_noise_std_min
+        self.flow_noise_std_max = config.flow_noise_std_max
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -98,6 +101,9 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
+        if self.flow_noise_enabled:
+            self.flow_noise_mlp_in = nnx.Linear(action_expert_config.width, config.flow_noise_hidden_dim, rngs=rngs)
+            self.flow_noise_mlp_out = nnx.Linear(config.flow_noise_hidden_dim, config.action_dim, rngs=rngs)
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -222,10 +228,28 @@ class Pi0(_model.BaseModel):
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
     ) -> _model.Actions:
+        sampled = self.sample_actions_with_trace(
+            rng,
+            observation,
+            num_steps=num_steps,
+            noise=noise,
+            stochastic=False,
+        )
+        return sampled["actions"]
+
+    def sample_actions_with_trace(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        num_steps: int = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+        stochastic: bool = True,
+    ) -> dict[str, object]:
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
-        dt = -1.0 / num_steps
+        dt = -1.0 / float(num_steps)
         batch_size = observation.state.shape[0]
         if noise is None:
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
@@ -236,8 +260,8 @@ class Pi0(_model.BaseModel):
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
-        def step(carry):
-            x_t, time = carry
+        def step(carry, _):
+            x_t, time, rng_t = carry
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
                 observation, x_t, jnp.broadcast_to(time, batch_size)
             )
@@ -267,13 +291,129 @@ class Pi0(_model.BaseModel):
             )
             assert prefix_out is None
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            x_t_mean = x_t + dt * v_t
+            if self.flow_noise_enabled and stochastic:
+                std = self._predict_flow_noise_std(suffix_out[:, -self.action_horizon :])
+                rng_t, sample_rng = jax.random.split(rng_t)
+                eps = jax.random.normal(sample_rng, x_t_mean.shape)
+                x_next = x_t_mean + eps * std
+            else:
+                std = jnp.zeros_like(x_t_mean)
+                x_next = x_t_mean
 
-            return x_t + dt * v_t, time + dt
+            logvar = jnp.where(std > 0, 2.0 * jnp.log(std), jnp.full_like(std, -jnp.inf))
+            step_metrics = {
+                "x_t": x_t,
+                "x_next": x_next,
+                "mean": x_t_mean,
+                "std": std,
+                "logvar": logvar,
+                "time": jnp.broadcast_to(time, (batch_size,)),
+            }
+            return (x_next, time + dt, rng_t), step_metrics
 
-        def cond(carry):
-            x_t, time = carry
-            # robust to floating-point error
-            return time >= -dt / 2
+        (x_0, _, _), per_step = jax.lax.scan(step, (noise, 1.0, rng), xs=None, length=num_steps)
+        x_t_seq = per_step["x_t"]  # [steps, b, ah, ad]
+        x_next_seq = per_step["x_next"]
+        chains = jnp.concatenate(
+            [
+                jnp.swapaxes(x_t_seq[:1], 0, 1),
+                jnp.swapaxes(x_next_seq, 0, 1),
+            ],
+            axis=1,
+        )
+        trace = {
+            "chains": chains,
+            "transition_means": jnp.swapaxes(per_step["mean"], 0, 1),
+            "transition_stds": jnp.swapaxes(per_step["std"], 0, 1),
+            "transition_logvars": jnp.swapaxes(per_step["logvar"], 0, 1),
+            "timesteps": jnp.swapaxes(per_step["time"], 0, 1),
+        }
+        return {
+            "actions": x_0,
+            "trace": trace,
+        }
 
-        x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
-        return x_0
+    @at.typecheck
+    def value_features(
+        self,
+        observation: _model.Observation,
+        *,
+        train: bool = False,
+    ) -> at.Float[at.Array, "b emb"]:
+        """Extract pooled VLM features for critic heads in RL."""
+
+        observation = _model.preprocess_observation(None, observation, train=train)
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_out, _), _ = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+        mask = prefix_mask.astype(prefix_out.dtype)[..., None]
+        denom = jnp.maximum(jnp.sum(mask, axis=1), 1.0)
+        return jnp.sum(prefix_out * mask, axis=1) / denom
+
+    def compute_flow_noise_logprob(
+        self,
+        trace: dict[str, at.Array],
+        *,
+        samples: at.Float[at.Array, "b s ah ad"] | None = None,
+        action_mask: at.Float[at.Array, " ad"] | None = None,
+        include_initial_prior: bool = True,
+        reduce_action_dims: bool = True,
+        reduce_denoise_steps: bool = True,
+    ) -> dict[str, at.Array]:
+        chains = trace["chains"]
+        step_samples = chains[:, 1:] if samples is None else samples
+        means = trace["transition_means"]
+        stds = trace["transition_stds"]
+
+        transition_logprob = self._gaussian_logprob(step_samples, means, stds)
+        if include_initial_prior:
+            initial_noise = chains[:, 0]
+            initial_logprob = self._gaussian_logprob(
+                initial_noise, jnp.zeros_like(initial_noise), jnp.ones_like(initial_noise)
+            )
+            step_logprob = jnp.concatenate([initial_logprob[:, None], transition_logprob], axis=1)
+        else:
+            initial_logprob = jnp.zeros_like(transition_logprob[:, 0])
+            step_logprob = transition_logprob
+
+        if action_mask is not None:
+            action_mask = action_mask.astype(step_logprob.dtype)
+            transition_logprob = transition_logprob * action_mask[None, None, None, :]
+            if include_initial_prior:
+                initial_logprob = initial_logprob * action_mask[None, None, :]
+                step_logprob = jnp.concatenate([initial_logprob[:, None], transition_logprob], axis=1)
+            else:
+                step_logprob = transition_logprob
+
+        joint_logprob = step_logprob
+        if reduce_action_dims:
+            joint_logprob = jnp.sum(joint_logprob, axis=(-1, -2))
+        if reduce_denoise_steps:
+            joint_logprob = jnp.sum(joint_logprob, axis=1)
+
+        return {
+            "joint_logprob": joint_logprob,
+            "step_logprob": step_logprob,
+            "transition_logprob": transition_logprob,
+            "initial_logprob": initial_logprob,
+        }
+
+    @at.typecheck
+    def _predict_flow_noise_std(self, suffix_out: at.Float[at.Array, "b ah emb"]) -> at.Float[at.Array, "b ah ad"]:
+        noise_hidden = self.flow_noise_mlp_in(suffix_out)
+        noise_hidden = nnx.swish(noise_hidden)
+        raw_noise = self.flow_noise_mlp_out(noise_hidden)
+        return self.flow_noise_std_min + (self.flow_noise_std_max - self.flow_noise_std_min) * jax.nn.sigmoid(raw_noise)
+
+    def _gaussian_logprob(
+        self,
+        sample: at.Array,
+        mean: at.Array,
+        std: at.Array,
+    ) -> at.Array:
+        safe_std = jnp.where(std > 0, std, jnp.ones_like(std))
+        log_normalizer = -jnp.log(safe_std) - 0.5 * jnp.log(2.0 * jnp.pi)
+        exp_term = -0.5 * jnp.square((sample - mean) / safe_std)
+        return jnp.where(std > 0, log_normalizer + exp_term, jnp.zeros_like(sample))
