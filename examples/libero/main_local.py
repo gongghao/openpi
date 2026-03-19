@@ -10,6 +10,7 @@ import dataclasses
 import logging
 import math
 import pathlib
+from datetime import date
 
 from libero.libero import benchmark
 from libero.libero import get_libero_path
@@ -26,12 +27,22 @@ LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
 
 
 @dataclasses.dataclass
+class Checkpoint:
+    """Load a policy from a trained checkpoint (same as scripts/serve_policy.py)."""
+
+    # Training config name (e.g., "pi0_libero").
+    config: str = "pi0_libero"
+    # Checkpoint directory (e.g., "s3://openpi-assets/checkpoints/pi0_libero").
+    dir: str = "s3://openpi-assets/checkpoints/pi0_libero"
+
+
+@dataclasses.dataclass
 class Args:
     #################################################################################################################
     # Policy parameters (local inference - no WebSocket)
     #################################################################################################################
-    policy_config: str = "pi0_libero"
-    policy_dir: str = "s3://openpi-assets/checkpoints/pi0_libero"
+    # Policy checkpoint: use --policy.config and --policy.dir to specify (same as scripts/serve_policy.py).
+    policy: Checkpoint = dataclasses.field(default_factory=Checkpoint)
     resize_size: int = 224
     replan_steps: int = 5
 
@@ -58,8 +69,8 @@ def eval_libero(args: Args) -> None:
 
     # Load policy locally (no WebSocket)
     logging.info("Loading policy locally...")
-    train_config = _config.get_config(args.policy_config)
-    client = _policy_config.create_trained_policy(train_config, args.policy_dir)
+    train_config = _config.get_config(args.policy.config)
+    client = _policy_config.create_trained_policy(train_config, args.policy.dir)
     logging.info("Policy loaded.")
 
     # Initialize LIBERO task suite
@@ -68,7 +79,9 @@ def eval_libero(args: Args) -> None:
     num_tasks_in_suite = task_suite.n_tasks
     logging.info(f"Task suite: {args.task_suite_name}")
 
-    pathlib.Path(args.frame_archive_path).mkdir(parents=True, exist_ok=True)
+    # Frame archives are saved under: {frame_archive_path}/{date}/{task_suite_name}/task_{id}_{name}/
+    archive_date = date.today().isoformat()
+    base_archive_dir = pathlib.Path(args.frame_archive_path) / archive_date / args.task_suite_name
 
     if args.task_suite_name == "libero_spatial":
         max_steps = 220  # longest training demo has 193 steps
@@ -176,13 +189,12 @@ def eval_libero(args: Args) -> None:
             total_episodes += 1
 
             # Save per-episode replay frames as an archive for offline video conversion.
+            # Organized by: date / task_suite / sub-task (task_id + task name) / rollout_episode_{idx}_{success|failure}.npz
             suffix = "success" if done else "failure"
-            task_segment = task_description.replace(" ", "_")
-            # Save raw replay frames for offline MP4 conversion in a separate process.
-            # This avoids subprocess/fork during JAX inference and prevents deadlock warnings.
-            archive_path = pathlib.Path(args.frame_archive_path) / (
-                f"rollout_task{task_id:03d}_episode{episode_idx:03d}_{task_segment}_{suffix}.npz"
-            )
+            task_segment = task_description.replace(" ", "_").replace("/", "_")
+            sub_task_dir = base_archive_dir / f"task_{task_id:03d}_{task_segment}"
+            sub_task_dir.mkdir(parents=True, exist_ok=True)
+            archive_path = sub_task_dir / f"rollout_episode{episode_idx:03d}_{suffix}.npz"
             np.savez_compressed(
                 archive_path,
                 frames=np.asarray(replay_images, dtype=np.uint8),

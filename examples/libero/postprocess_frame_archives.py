@@ -23,13 +23,14 @@ class Args:
 
 
 def main(args: Args) -> None:
-    archive_dir = pathlib.Path(args.frame_archive_path)
-    video_dir = pathlib.Path(args.video_out_path)
+    archive_dir = pathlib.Path(args.frame_archive_path).resolve()
+    video_dir = pathlib.Path(args.video_out_path).resolve()
     video_dir.mkdir(parents=True, exist_ok=True)
 
-    archives = sorted(archive_dir.glob("*.npz"))
+    # Recursively find all .npz under archive_dir (supports date/suite/task subdirs from main_local.py)
+    archives = sorted(archive_dir.rglob("*.npz"))
     if not archives:
-        logging.warning("No frame archives found in %s", archive_dir)
+        logging.warning("No frame archives found under %s", archive_dir)
         return
 
     logging.info("Converting %d archives from %s", len(archives), archive_dir)
@@ -41,7 +42,14 @@ def main(args: Args) -> None:
         elif archive_path.stem.endswith("_failure"):
             num_failure += 1
 
-        out_path = video_dir / f"{archive_path.stem}.mp4"
+        # Mirror archive directory structure under video_out_path (e.g. 2025-03-19/libero_spatial/task_000_.../rollout_episode000_success.mp4)
+        try:
+            rel = archive_path.relative_to(archive_dir)
+        except ValueError:
+            rel = archive_path.name
+        out_path = video_dir / rel.with_suffix(".mp4")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
         if out_path.exists() and not args.overwrite:
             continue
 
