@@ -188,6 +188,13 @@ def train_step(
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
     }
+
+    if getattr(model, "use_mixed_noise", False):
+        shared_mu = model.shared_mu.value
+        shared_log_sigma = jnp.clip(model.shared_log_sigma.value, -2.0, 2.0)
+        info["mixed_noise/shared_mu_norm"] = jnp.sqrt(jnp.mean(shared_mu ** 2))
+        info["mixed_noise/shared_sigma_mean"] = jnp.mean(jnp.exp(shared_log_sigma))
+
     return new_state, info
 
 

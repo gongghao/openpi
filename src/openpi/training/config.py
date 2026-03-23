@@ -676,6 +676,21 @@ _CONFIGS = [
         num_train_steps=30_000,
     ),
     TrainConfig(
+        name="pi0_libero_mixed_noise",
+        model=pi0_config.Pi0Config(
+            use_mixed_noise=True,
+            noise_mix_alpha=0.3,
+            noise_kl_weight=0.01,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
         name="pi0_libero_low_mem_finetune",
         # Here is an example of loading a pi0 model for LoRA fine-tuning.
         model=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),

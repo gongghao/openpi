@@ -37,6 +37,13 @@ class Pi0Config(_model.BaseModelConfig):
     flow_noise_std_min: float = 0.08
     flow_noise_std_max: float = 0.16
 
+    # Mixed noise: decompose source distribution into shared (general arm prior)
+    # and task-specific (per-task action pattern) learnable components.
+    use_mixed_noise: bool = False
+    noise_mix_alpha: float = 0.3
+    noise_kl_weight: float = 0.01
+    noise_head_hidden_dim: int | None = None
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)

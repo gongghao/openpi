@@ -101,6 +101,20 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
+
+        # Mixed noise modules: shared (global learnable) + task-specific (MLP from language embedding).
+        self.use_mixed_noise = config.use_mixed_noise
+        self.noise_mix_alpha = config.noise_mix_alpha
+        self.noise_kl_weight = config.noise_kl_weight
+        if self.use_mixed_noise:
+            self.shared_mu = nnx.Param(jnp.zeros((config.action_horizon, config.action_dim)))
+            self.shared_log_sigma = nnx.Param(jnp.zeros((config.action_horizon, config.action_dim)))
+            noise_hidden_dim = config.noise_head_hidden_dim or action_expert_config.width
+            noise_out_dim = config.action_horizon * config.action_dim
+            self.task_noise_hidden = nnx.Linear(paligemma_config.width, noise_hidden_dim, rngs=rngs)
+            self.task_noise_mu_head = nnx.Linear(noise_hidden_dim, noise_out_dim, rngs=rngs)
+            self.task_noise_log_sigma_head = nnx.Linear(noise_hidden_dim, noise_out_dim, rngs=rngs)
+
         if self.flow_noise_enabled:
             self.flow_noise_mlp_in = nnx.Linear(action_expert_config.width, config.flow_noise_hidden_dim, rngs=rngs)
             self.flow_noise_mlp_out = nnx.Linear(config.flow_noise_hidden_dim, config.action_dim, rngs=rngs)
@@ -191,6 +205,60 @@ class Pi0(_model.BaseModel):
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask, adarms_cond
 
+    # ---- Mixed noise helpers ----
+
+    def _get_task_emb(self, obs: _model.Observation) -> at.Float[at.Array, "b emb"]:
+        """Masked mean-pool over tokenized prompt embeddings."""
+        token_embs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")  # [B, L, D]
+        mask = obs.tokenized_prompt_mask[..., None].astype(token_embs.dtype)   # [B, L, 1]
+        return jnp.sum(token_embs * mask, axis=1) / jnp.maximum(jnp.sum(mask, axis=1), 1.0)
+
+    def _predict_task_noise_params(
+        self, task_emb: at.Float[at.Array, "b emb"]
+    ) -> tuple[at.Float[at.Array, "b ah ad"], at.Float[at.Array, "b ah ad"]]:
+        """Predict per-task noise mean and log-std from language embedding."""
+        h = nnx.swish(self.task_noise_hidden(task_emb))
+        mu = self.task_noise_mu_head(h)
+        log_sigma = self.task_noise_log_sigma_head(h)
+        mu = mu.reshape(task_emb.shape[0], self.action_horizon, self.action_dim)
+        log_sigma = log_sigma.reshape(task_emb.shape[0], self.action_horizon, self.action_dim)
+        log_sigma = jnp.clip(log_sigma, -2.0, 2.0)
+        return mu, log_sigma
+
+    def _diagonal_kl_to_standard(
+        self, mu: at.Array, log_sigma: at.Array
+    ) -> at.Float[at.Array, ""]:
+        """KL(N(mu, sigma^2 I) || N(0, I)), averaged over all dimensions."""
+        var = jnp.exp(2.0 * log_sigma)
+        return 0.5 * jnp.mean(mu ** 2 + var - 1.0 - 2.0 * log_sigma)
+
+    def _compute_mixed_noise(
+        self, rng: at.KeyArrayLike, obs: _model.Observation, shape: tuple
+    ) -> tuple[at.Array, at.Float[at.Array, ""]]:
+        """Sample mixed noise and return (noise, kl_loss)."""
+        rng_shared, rng_task = jax.random.split(rng)
+
+        sigma_s = jnp.exp(jnp.clip(self.shared_log_sigma.value, -2.0, 2.0))
+        eps_shared = self.shared_mu.value + sigma_s * jax.random.normal(rng_shared, shape)
+
+        task_emb = self._get_task_emb(obs)
+        mu_k, log_sigma_k = self._predict_task_noise_params(task_emb)
+        sigma_k = jnp.exp(log_sigma_k)
+        eps_task = mu_k + sigma_k * jax.random.normal(rng_task, shape)
+
+        alpha = self.noise_mix_alpha
+        noise = jnp.sqrt(1.0 - alpha ** 2) * eps_shared + alpha * eps_task
+
+        kl_shared = self._diagonal_kl_to_standard(
+            self.shared_mu.value, jnp.clip(self.shared_log_sigma.value, -2.0, 2.0)
+        )
+        kl_task = self._diagonal_kl_to_standard(mu_k, log_sigma_k)
+        kl_loss = kl_shared + kl_task
+
+        return noise, kl_loss
+
+    # ---- End mixed noise helpers ----
+
     @override
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
@@ -199,13 +267,22 @@ class Pi0(_model.BaseModel):
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
         batch_shape = actions.shape[:-2]
-        noise = jax.random.normal(noise_rng, actions.shape)
+
+        if self.use_mixed_noise:
+            noise, kl_loss = self._compute_mixed_noise(noise_rng, observation, actions.shape)
+        else:
+            noise = jax.random.normal(noise_rng, actions.shape)
+            kl_loss = 0.0
+
         time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
         time_expanded = time[..., None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
 
-        # one big forward pass of prefix + suffix at once
+        if self.use_mixed_noise:
+            u_t = jax.lax.stop_gradient(noise) - actions
+        else:
+            u_t = noise - actions
+
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
@@ -217,7 +294,11 @@ class Pi0(_model.BaseModel):
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        fm_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)  # [*b, ah]
+        if self.use_mixed_noise:
+            kl_per_element = self.noise_kl_weight * kl_loss / max(fm_loss.size, 1)
+            return fm_loss + kl_per_element
+        return fm_loss
 
     @override
     def sample_actions(
@@ -252,7 +333,12 @@ class Pi0(_model.BaseModel):
         dt = -1.0 / float(num_steps)
         batch_size = observation.state.shape[0]
         if noise is None:
-            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+            if self.use_mixed_noise:
+                noise, _ = self._compute_mixed_noise(
+                    rng, observation, (batch_size, self.action_horizon, self.action_dim)
+                )
+            else:
+                noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
         # first fill KV cache with a forward pass of the prefix
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
