@@ -7,6 +7,7 @@ python examples/libero/postprocess_frame_archives.py
 import dataclasses
 import logging
 import pathlib
+from collections import defaultdict
 
 import imageio
 import numpy as np
@@ -36,17 +37,29 @@ def main(args: Args) -> None:
     logging.info("Converting %d archives from %s", len(archives), archive_dir)
     num_success = 0
     num_failure = 0
+    suite_stats: dict[str, dict[str, int]] = defaultdict(lambda: {"success": 0, "failure": 0})
     for archive_path in tqdm.tqdm(archives):
-        if archive_path.stem.endswith("_success"):
-            num_success += 1
-        elif archive_path.stem.endswith("_failure"):
-            num_failure += 1
-
-        # Mirror archive directory structure under video_out_path (e.g. 2025-03-19/libero_spatial/task_000_.../rollout_episode000_success.mp4)
         try:
             rel = archive_path.relative_to(archive_dir)
         except ValueError:
-            rel = archive_path.name
+            rel = pathlib.Path(archive_path.name)
+
+        # Supports both "date/suite/task/*.npz" and "suite/task/*.npz" layouts.
+        if len(rel.parts) >= 2 and rel.parts[1].startswith("libero_"):
+            task_suite = rel.parts[1]
+        elif len(rel.parts) >= 1 and rel.parts[0].startswith("libero_"):
+            task_suite = rel.parts[0]
+        else:
+            task_suite = "unknown_suite"
+
+        if archive_path.stem.endswith("_success"):
+            num_success += 1
+            suite_stats[task_suite]["success"] += 1
+        elif archive_path.stem.endswith("_failure"):
+            num_failure += 1
+            suite_stats[task_suite]["failure"] += 1
+
+        # Mirror archive directory structure under video_out_path (e.g. 2025-03-19/libero_spatial/task_000_.../rollout_episode000_success.mp4)
         out_path = video_dir / rel.with_suffix(".mp4")
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -69,6 +82,20 @@ def main(args: Args) -> None:
         total,
         success_rate,
     )
+    logging.info("Success rate by task suite:")
+    for suite_name in sorted(suite_stats):
+        suite_success = suite_stats[suite_name]["success"]
+        suite_failure = suite_stats[suite_name]["failure"]
+        suite_total = suite_success + suite_failure
+        suite_rate = (suite_success / suite_total * 100.0) if suite_total > 0 else 0.0
+        logging.info(
+            "  %s: success=%d, failure=%d, total=%d, success_rate=%.2f%%",
+            suite_name,
+            suite_success,
+            suite_failure,
+            suite_total,
+            suite_rate,
+        )
 
 
 if __name__ == "__main__":

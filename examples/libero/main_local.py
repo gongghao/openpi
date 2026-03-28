@@ -2,6 +2,7 @@
 
 No WebSocket server required. Loads the policy directly in the same process.
 Run with: python examples/libero/main_local.py
+Multiple suites: --task-suite-names libero_spatial libero_object libero_goal libero_10
 
 Requires PYTHONPATH to include the openpi root (e.g. export PYTHONPATH=$PYTHONPATH:$PWD).
 """
@@ -49,9 +50,9 @@ class Args:
     #################################################################################################################
     # LIBERO environment-specific parameters
     #################################################################################################################
-    task_suite_name: str = (
-        "libero_spatial"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
-    )
+    # One or more suites in one run (policy loaded once). Example:
+    #   --task-suite-names libero_spatial libero_object libero_goal libero_10
+    task_suite_names: tuple[str, ...] = ("libero_spatial",)
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize in sim
     num_trials_per_task: int = 10  # Number of rollouts per task
 
@@ -61,6 +62,20 @@ class Args:
     frame_archive_path: str = "data/libero/frame_archives"  # Path to save per-episode frame archives (.npz)
 
     seed: int = 7  # Random Seed (for reproducibility)
+
+
+def _max_steps_for_suite(task_suite_name: str) -> int:
+    if task_suite_name == "libero_spatial":
+        return 220  # longest training demo has 193 steps
+    if task_suite_name == "libero_object":
+        return 280  # longest training demo has 254 steps
+    if task_suite_name == "libero_goal":
+        return 300  # longest training demo has 270 steps
+    if task_suite_name == "libero_10":
+        return 520  # longest training demo has 505 steps
+    if task_suite_name == "libero_90":
+        return 400  # longest training demo has 373 steps
+    raise ValueError(f"Unknown task suite: {task_suite_name}")
 
 
 def eval_libero(args: Args) -> None:
@@ -73,145 +88,154 @@ def eval_libero(args: Args) -> None:
     client = _policy_config.create_trained_policy(train_config, args.policy.dir)
     logging.info("Policy loaded.")
 
-    # Initialize LIBERO task suite
+    if not args.task_suite_names:
+        raise ValueError("task_suite_names must contain at least one suite.")
+
     benchmark_dict = benchmark.get_benchmark_dict()
-    task_suite = benchmark_dict[args.task_suite_name]()
-    num_tasks_in_suite = task_suite.n_tasks
-    logging.info(f"Task suite: {args.task_suite_name}")
+    unknown = [n for n in args.task_suite_names if n not in benchmark_dict]
+    if unknown:
+        valid = ", ".join(sorted(benchmark_dict))
+        raise ValueError(f"Unknown task suite(s): {unknown}. Valid names: {valid}")
 
-    # Frame archives are saved under: {frame_archive_path}/{date}/{task_suite_name}/task_{id}_{name}/
+    # Frame archives: {frame_archive_path}/{date}/{task_suite_name}/task_{id}_{name}/
     archive_date = date.today().isoformat()
-    base_archive_dir = pathlib.Path(args.frame_archive_path) / archive_date / args.task_suite_name
+    grand_total_episodes, grand_total_successes = 0, 0
 
-    if args.task_suite_name == "libero_spatial":
-        max_steps = 220  # longest training demo has 193 steps
-    elif args.task_suite_name == "libero_object":
-        max_steps = 280  # longest training demo has 254 steps
-    elif args.task_suite_name == "libero_goal":
-        max_steps = 300  # longest training demo has 270 steps
-    elif args.task_suite_name == "libero_10":
-        max_steps = 520  # longest training demo has 505 steps
-    elif args.task_suite_name == "libero_90":
-        max_steps = 400  # longest training demo has 373 steps
-    else:
-        raise ValueError(f"Unknown task suite: {args.task_suite_name}")
+    for suite_name in args.task_suite_names:
+        max_steps = _max_steps_for_suite(suite_name)
+        task_suite = benchmark_dict[suite_name]()
+        num_tasks_in_suite = task_suite.n_tasks
+        logging.info(f"Task suite: {suite_name} ({num_tasks_in_suite} tasks)")
+        base_archive_dir = pathlib.Path(args.frame_archive_path) / archive_date / suite_name
 
-    # Start evaluation
-    total_episodes, total_successes = 0, 0
-    for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
-        # Get task
-        task = task_suite.get_task(task_id)
+        total_episodes, total_successes = 0, 0
+        for task_id in tqdm.tqdm(range(num_tasks_in_suite), desc=f"{suite_name} tasks"):
+            # Get task
+            task = task_suite.get_task(task_id)
 
-        # Get default LIBERO initial states
-        initial_states = task_suite.get_task_init_states(task_id)
+            # Get default LIBERO initial states
+            initial_states = task_suite.get_task_init_states(task_id)
 
-        # Initialize LIBERO environment and task description
-        env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
+            # Initialize LIBERO environment and task description
+            env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
 
-        # Start episodes
-        task_episodes, task_successes = 0, 0
-        for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
-            logging.info(f"\nTask: {task_description}")
+            # Start episodes
+            task_episodes, task_successes = 0, 0
+            for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
+                logging.info(f"\nTask: {task_description}")
 
-            # Reset environment
-            env.reset()
-            action_plan = collections.deque()
+                # Reset environment
+                env.reset()
+                action_plan = collections.deque()
 
-            # Set initial states
-            obs = env.set_init_state(initial_states[episode_idx])
+                # Set initial states
+                obs = env.set_init_state(initial_states[episode_idx])
 
-            # Setup
-            t = 0
-            replay_images = []
+                # Setup
+                t = 0
+                replay_images = []
 
-            logging.info(f"Starting episode {task_episodes+1}...")
-            while t < max_steps + args.num_steps_wait:
-                try:
-                    # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
-                    # and we need to wait for them to fall
-                    if t < args.num_steps_wait:
-                        obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
+                logging.info(f"Starting episode {task_episodes+1}...")
+                while t < max_steps + args.num_steps_wait:
+                    try:
+                        # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
+                        # and we need to wait for them to fall
+                        if t < args.num_steps_wait:
+                            obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
+                            t += 1
+                            continue
+
+                        # Get preprocessed image
+                        # IMPORTANT: rotate 180 degrees to match train preprocessing
+                        img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
+                        wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
+                        img = image_tools.convert_to_uint8(
+                            image_tools.resize_with_pad(img, args.resize_size, args.resize_size)
+                        )
+                        wrist_img = image_tools.convert_to_uint8(
+                            image_tools.resize_with_pad(wrist_img, args.resize_size, args.resize_size)
+                        )
+
+                        # Save preprocessed image for replay video
+                        replay_images.append(img)
+
+                        if not action_plan:
+                            # Finished executing previous action chunk -- compute new chunk
+                            # Prepare observations dict
+                            element = {
+                                "observation/image": img,
+                                "observation/wrist_image": wrist_img,
+                                "observation/state": np.concatenate(
+                                    (
+                                        obs["robot0_eef_pos"],
+                                        _quat2axisangle(obs["robot0_eef_quat"]),
+                                        obs["robot0_gripper_qpos"],
+                                    )
+                                ),
+                                "prompt": str(task_description),
+                            }
+
+                            # Query model to get action (local inference)
+                            action_chunk = client.infer(element)["actions"]
+                            assert (
+                                len(action_chunk) >= args.replan_steps
+                            ), f"We want to replan every {args.replan_steps} steps, but policy only predicts {len(action_chunk)} steps."
+                            action_plan.extend(action_chunk[: args.replan_steps])
+
+                        action = action_plan.popleft()
+
+                        # Execute action in environment
+                        obs, reward, done, info = env.step(action.tolist())
+                        if done:
+                            task_successes += 1
+                            total_successes += 1
+                            break
                         t += 1
-                        continue
 
-                    # Get preprocessed image
-                    # IMPORTANT: rotate 180 degrees to match train preprocessing
-                    img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
-                    wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
-                    img = image_tools.convert_to_uint8(
-                        image_tools.resize_with_pad(img, args.resize_size, args.resize_size)
-                    )
-                    wrist_img = image_tools.convert_to_uint8(
-                        image_tools.resize_with_pad(wrist_img, args.resize_size, args.resize_size)
-                    )
-
-                    # Save preprocessed image for replay video
-                    replay_images.append(img)
-
-                    if not action_plan:
-                        # Finished executing previous action chunk -- compute new chunk
-                        # Prepare observations dict
-                        element = {
-                            "observation/image": img,
-                            "observation/wrist_image": wrist_img,
-                            "observation/state": np.concatenate(
-                                (
-                                    obs["robot0_eef_pos"],
-                                    _quat2axisangle(obs["robot0_eef_quat"]),
-                                    obs["robot0_gripper_qpos"],
-                                )
-                            ),
-                            "prompt": str(task_description),
-                        }
-
-                        # Query model to get action (local inference)
-                        action_chunk = client.infer(element)["actions"]
-                        assert (
-                            len(action_chunk) >= args.replan_steps
-                        ), f"We want to replan every {args.replan_steps} steps, but policy only predicts {len(action_chunk)} steps."
-                        action_plan.extend(action_chunk[: args.replan_steps])
-
-                    action = action_plan.popleft()
-
-                    # Execute action in environment
-                    obs, reward, done, info = env.step(action.tolist())
-                    if done:
-                        task_successes += 1
-                        total_successes += 1
+                    except Exception as e:
+                        logging.error(f"Caught exception: {e}")
                         break
-                    t += 1
 
-                except Exception as e:
-                    logging.error(f"Caught exception: {e}")
-                    break
+                task_episodes += 1
+                total_episodes += 1
 
-            task_episodes += 1
-            total_episodes += 1
+                # Save per-episode replay frames as an archive for offline video conversion.
+                # Organized by: date / task_suite / sub-task (task_id + task name) / rollout_episode_{idx}_{success|failure}.npz
+                suffix = "success" if done else "failure"
+                task_segment = task_description.replace(" ", "_").replace("/", "_")
+                sub_task_dir = base_archive_dir / f"task_{task_id:03d}_{task_segment}"
+                sub_task_dir.mkdir(parents=True, exist_ok=True)
+                archive_path = sub_task_dir / f"rollout_episode{episode_idx:03d}_{suffix}.npz"
+                np.savez_compressed(
+                    archive_path,
+                    frames=np.asarray(replay_images, dtype=np.uint8),
+                    fps=np.asarray(10, dtype=np.int32),
+                )
 
-            # Save per-episode replay frames as an archive for offline video conversion.
-            # Organized by: date / task_suite / sub-task (task_id + task name) / rollout_episode_{idx}_{success|failure}.npz
-            suffix = "success" if done else "failure"
-            task_segment = task_description.replace(" ", "_").replace("/", "_")
-            sub_task_dir = base_archive_dir / f"task_{task_id:03d}_{task_segment}"
-            sub_task_dir.mkdir(parents=True, exist_ok=True)
-            archive_path = sub_task_dir / f"rollout_episode{episode_idx:03d}_{suffix}.npz"
-            np.savez_compressed(
-                archive_path,
-                frames=np.asarray(replay_images, dtype=np.uint8),
-                fps=np.asarray(10, dtype=np.int32),
-            )
+                # Log current results
+                logging.info(f"Success: {done}")
+                logging.info(f"# episodes completed so far: {total_episodes}")
+                logging.info(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
 
-            # Log current results
-            logging.info(f"Success: {done}")
-            logging.info(f"# episodes completed so far: {total_episodes}")
-            logging.info(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
+            # Log final results
+            logging.info(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
+            logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
 
-        # Log final results
-        logging.info(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
-        logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
+        logging.info(
+            f"Suite '{suite_name}' finished: success rate {float(total_successes) / float(total_episodes):.4f} "
+            f"({total_successes}/{total_episodes} episodes)"
+        )
+        grand_total_episodes += total_episodes
+        grand_total_successes += total_successes
 
-    logging.info(f"Total success rate: {float(total_successes) / float(total_episodes)}")
-    logging.info(f"Total episodes: {total_episodes}")
+    if len(args.task_suite_names) > 1:
+        logging.info(
+            f"All suites combined: success rate {float(grand_total_successes) / float(grand_total_episodes):.4f} "
+            f"({grand_total_successes}/{grand_total_episodes} episodes)"
+        )
+    else:
+        logging.info(f"Total success rate: {float(grand_total_successes) / float(grand_total_episodes)}")
+        logging.info(f"Total episodes: {grand_total_episodes}")
 
 
 def _get_libero_env(task, resolution, seed):

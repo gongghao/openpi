@@ -498,7 +498,7 @@ class TrainConfig:
     # Base directory for config assets (e.g., norm stats).
     assets_base_dir: str = "./assets"
     # Base directory for checkpoints.
-    checkpoint_base_dir: str = "./checkpoints"
+    checkpoint_base_dir: str = "/seu_share/home/linli/213221101/checkpoints"
 
     # Random seed that will be used by random generators during training.
     seed: int = 42
@@ -523,7 +523,7 @@ class TrainConfig:
     resume: bool = False
 
     # If true, will enable wandb logging.
-    wandb_enabled: bool = True
+    wandb_enabled: bool = False
 
     # Used to pass metadata to the policy server.
     policy_metadata: dict[str, Any] | None = None
@@ -687,8 +687,12 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=True,
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi0_base/params",
+            extra_missing_regex=".*(shared_mu|shared_log_sigma|task_noise_hidden|task_noise_mu_head|task_noise_log_sigma_head).*",
+        ),
         num_train_steps=30_000,
+        save_interval=5000,
     ),
     TrainConfig(
         name="pi0_libero_low_mem_finetune",
