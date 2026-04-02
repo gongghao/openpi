@@ -52,9 +52,9 @@ class Args:
     #################################################################################################################
     # One or more suites in one run (policy loaded once). Example:
     #   --task-suite-names libero_spatial libero_object libero_goal libero_10
-    task_suite_names: tuple[str, ...] = ("libero_spatial",)
+    task_suite_names: tuple[str, ...] = ("libero_spatial", "libero_object", "libero_goal", "libero_10")
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize in sim
-    num_trials_per_task: int = 10  # Number of rollouts per task
+    num_trials_per_task: int = 50  # Number of rollouts per task
 
     #################################################################################################################
     # Utils
