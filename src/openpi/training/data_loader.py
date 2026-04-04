@@ -300,6 +300,17 @@ def create_torch_data_loader(
         seed: The seed to use for shuffling the data.
     """
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
+
+    if data_config.few_shot_enabled and data_config.few_shot_episodes_per_task is not None:
+        from openpi.training.fewshot_dataset import FewShotEpisodeDataset
+
+        dataset = FewShotEpisodeDataset(
+            base_dataset=dataset,
+            episodes_per_task=data_config.few_shot_episodes_per_task,
+            seed=data_config.few_shot_seed,
+        )
+        logging.info(f"Few-shot dataset: {len(dataset)} frames from selected episodes")
+
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     # Use TorchDataLoader for both frameworks

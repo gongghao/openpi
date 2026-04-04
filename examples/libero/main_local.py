@@ -32,9 +32,9 @@ class Checkpoint:
     """Load a policy from a trained checkpoint (same as scripts/serve_policy.py)."""
 
     # Training config name (e.g., "pi0_libero").
-    config: str = "pi0_libero"
+    config: str = "pi0_libero_mixed_noise"
     # Checkpoint directory (e.g., "s3://openpi-assets/checkpoints/pi0_libero").
-    dir: str = "s3://openpi-assets/checkpoints/pi0_libero"
+    dir: str = "/seu_share/home/linli/213221101/checkpoints/pi0_libero_mixed_noise/physical-intelligence/libero/29999"
 
 
 @dataclasses.dataclass
