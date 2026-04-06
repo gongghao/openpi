@@ -277,6 +277,9 @@ class BaseModel(nnx.Module, abc.ABC):
         actions: Actions,
         *,
         train: bool = False,
+        advantages: at.Float[at.Array, " *b"] | None = None,
+        rwfm_beta: float = 1.0,
+        rwfm_noise_adaptive: bool = True,
     ) -> at.Float[at.Array, "*b ah"]: ...
 
     @abc.abstractmethod

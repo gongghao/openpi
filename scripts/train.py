@@ -139,24 +139,45 @@ def train_step(
     config: _config.TrainConfig,
     rng: at.KeyArrayLike,
     state: training_utils.TrainState,
-    batch: tuple[_model.Observation, _model.Actions],
+    batch: tuple[_model.Observation, _model.Actions]
+    | tuple[_model.Observation, _model.Actions, at.Float[at.Array, " b"] | None],
 ) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
     model = nnx.merge(state.model_def, state.params)
     model.train()
 
+    rwfm_enabled = getattr(config, "rwfm_enabled", False)
+    rwfm_beta = getattr(config, "rwfm_beta", 1.0)
+    rwfm_noise_adaptive = getattr(config, "rwfm_noise_adaptive", True)
+
     @at.typecheck
     def loss_fn(
-        model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
+        model: _model.BaseModel,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        advantages: at.Float[at.Array, " b"] | None = None,
     ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
+        chunked_loss = model.compute_loss(
+            rng,
+            observation,
+            actions,
+            train=True,
+            advantages=advantages if rwfm_enabled else None,
+            rwfm_beta=rwfm_beta,
+            rwfm_noise_adaptive=rwfm_noise_adaptive,
+        )
         return jnp.mean(chunked_loss)
 
     train_rng = jax.random.fold_in(rng, state.step)
-    observation, actions = batch
+    if len(batch) == 3:
+        observation, actions, advantages = batch
+    else:
+        observation, actions = batch
+        advantages = None
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions, advantages)
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)

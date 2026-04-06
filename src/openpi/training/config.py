@@ -540,6 +540,12 @@ class TrainConfig:
     # data parallel between 2 groups of devices.
     fsdp_devices: int = 1
 
+    # --- RWFM (Reward-Weighted Flow Matching) RL settings ---
+    rwfm_enabled: bool = False
+    rwfm_beta: float = 1.0
+    rwfm_noise_adaptive: bool = True
+    rwfm_advantages_path: str | None = None
+
     @property
     def assets_dirs(self) -> pathlib.Path:
         """Get the assets directory for this config."""
@@ -830,6 +836,28 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=5_000,
+    ),
+    #
+    # RWFM RL fine-tuning from few-shot SFT checkpoint.
+    #
+    TrainConfig(
+        name="pi0_libero_rwfm",
+        model=pi0_config.Pi0Config(),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+            extra_delta_transform=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "{checkpoint_base_dir}/pi0_libero_fewshot/sft_seed/4999/params"
+        ),
+        num_train_steps=10_000,
+        rwfm_enabled=True,
+        rwfm_beta=1.0,
+        rwfm_noise_adaptive=True,
+        rwfm_advantages_path="data/libero/advantages.npz",
     ),
     #
     # Fine-tuning Aloha configs.

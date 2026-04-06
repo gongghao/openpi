@@ -254,7 +254,15 @@ class Pi0(_model.BaseModel):
 
     @override
     def compute_loss(
-        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        *,
+        train: bool = False,
+        advantages: at.Float[at.Array, " *b"] | None = None,
+        rwfm_beta: float = 1.0,
+        rwfm_noise_adaptive: bool = True,
     ) -> at.Float[at.Array, "*b ah"]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
@@ -286,6 +294,15 @@ class Pi0(_model.BaseModel):
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
         fm_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)  # [*b, ah]
+
+        # RWFM: reweight flow-matching loss by exponentiated advantage
+        if advantages is not None:
+            raw_w = jnp.exp(advantages / rwfm_beta)
+            weights = raw_w / jnp.mean(raw_w)
+            if rwfm_noise_adaptive:
+                weights = 1.0 + (1.0 - time) * (weights - 1.0)
+            fm_loss = fm_loss * weights[..., None]
+
         if self.use_mixed_noise:
             kl_per_element = self.noise_kl_weight * kl_loss / max(fm_loss.size, 1)
             return fm_loss + kl_per_element
@@ -299,6 +316,9 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        value_fn=None,
+        guidance_scale: float = 0.0,
+        guidance_noise_adaptive: bool = True,
     ) -> _model.Actions:
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
@@ -350,6 +370,18 @@ class Pi0(_model.BaseModel):
             )
             assert prefix_out is None
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+
+            # Classifier Guidance: steer ODE toward higher-value actions
+            if value_fn is not None and guidance_scale > 0:
+                def _value_for_grad(x_flat):
+                    x = x_flat.reshape(batch_size, self.action_horizon, self.action_dim)
+                    time_bc = jnp.broadcast_to(time, (batch_size,))
+                    return jnp.sum(value_fn(x, time_bc))
+
+                grad_v = jax.grad(_value_for_grad)(x_t.reshape(batch_size, -1))
+                grad_v = grad_v.reshape(batch_size, self.action_horizon, self.action_dim)
+                lam = guidance_scale * (1.0 - time) if guidance_noise_adaptive else guidance_scale
+                v_t = v_t - lam * grad_v
 
             return x_t + dt * v_t, time + dt
 

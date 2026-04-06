@@ -548,4 +548,9 @@ class DataLoaderImpl(DataLoader):
 
     def __iter__(self):
         for batch in self._data_loader:
-            yield _model.Observation.from_dict(batch), batch["actions"]
+            obs = _model.Observation.from_dict(batch)
+            actions = batch["actions"]
+            if "advantages" in batch:
+                yield obs, actions, batch["advantages"]
+            else:
+                yield obs, actions
