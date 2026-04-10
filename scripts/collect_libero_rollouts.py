@@ -40,7 +40,7 @@ C_FAIL = 200  # large penalty for failed episodes
 @dataclasses.dataclass
 class Checkpoint:
     config: str = "pi0_libero_fewshot"
-    dir: str = ""
+    dir: str = "/seu_share/home/linli/213221101/checkpoints/pi0_libero_fewshot/physical-intelligence/libero/4999"
 
 
 @dataclasses.dataclass
@@ -53,7 +53,7 @@ class Args:
     num_steps_wait: int = 10
     num_trials_per_task: int = 50
 
-    output_dir: str = "data/libero/rollouts"
+    output_dir: str = "/seu_share/home/linli/213221101/MyDatasets/data/libero/rollouts"
     seed: int = 7
 
 
@@ -89,7 +89,11 @@ def compute_returns(rewards: np.ndarray) -> np.ndarray:
 
 
 def normalize_returns(returns: np.ndarray, max_episode_length: int) -> np.ndarray:
-    return returns / max(max_episode_length, 1)
+    # Keep normalized returns in [-1, 0] to match the value head support.
+    # Raw returns are non-positive in this setup, but failure penalties can push
+    # them below -1 after dividing by max steps, so we clip the lower bound.
+    norm = returns / max(max_episode_length, 1)
+    return np.clip(norm, -1.0, 0.0).astype(np.float32)
 
 
 def _get_libero_env(task, resolution, seed):
@@ -145,9 +149,10 @@ def main(args: Args) -> None:
             task_dir = suite_dir / f"task_{task_id:03d}_{task_segment}"
             task_dir.mkdir(parents=True, exist_ok=True)
 
+            num_initial_states = len(initial_states)
             for ep_idx in tqdm.tqdm(range(args.num_trials_per_task), leave=False):
                 env.reset()
-                obs = env.set_init_state(initial_states[ep_idx])
+                obs = env.set_init_state(initial_states[ep_idx % num_initial_states])
                 action_plan: collections.deque = collections.deque()
 
                 ep_images, ep_wrist_images, ep_states, ep_actions = [], [], [], []

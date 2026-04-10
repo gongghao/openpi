@@ -44,7 +44,6 @@ class StateValueFunction(nnx.Module):
         self.mlp1 = nnx.Linear(hidden_dim * 3, hidden_dim, rngs=rngs)
         self.mlp2 = nnx.Linear(hidden_dim, hidden_dim, rngs=rngs)
         self.head = nnx.Linear(hidden_dim, num_bins, rngs=rngs)
-        self.bin_values = jnp.linspace(-1.0, 0.0, num_bins)
 
     def __call__(
         self,
@@ -63,7 +62,9 @@ class StateValueFunction(nnx.Module):
     def predict_value(self, image_emb, state, lang_emb) -> at.Float[at.Array, " b"]:
         logits = self(image_emb, state, lang_emb)
         probs = jax.nn.softmax(logits, axis=-1)
-        return jnp.sum(probs * self.bin_values, axis=-1)
+        # NNX modules must not hold raw Array attributes (breaks nnx.state(..., nnx.Param)).
+        bin_values = jnp.linspace(-1.0, 0.0, self.num_bins)
+        return jnp.sum(probs * bin_values, axis=-1)
 
 
 class ActionConditionedValueFunction(nnx.Module):

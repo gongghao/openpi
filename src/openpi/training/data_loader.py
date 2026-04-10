@@ -2,6 +2,7 @@ from collections.abc import Iterator, Sequence
 import logging
 import multiprocessing
 import os
+import pathlib
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
@@ -127,10 +128,67 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+class RolloutNpzDataset:
+    """Dataset that reads rollout episode .npz archives and yields per-frame
+    samples in the same format as the LeRobot LIBERO dataset.
+
+    Each sample is a dict with:
+        ``image``, ``wrist_image``, ``state``, ``actions``, ``prompt``
+    which matches the keys expected by the LIBERO ``RepackTransform``.
+    """
+
+    def __init__(self, rollout_dir: str, action_horizon: int = 50):
+        import glob as _glob
+
+        pattern = str(pathlib.Path(rollout_dir) / "**" / "episode_*.npz")
+        paths = sorted(_glob.glob(pattern, recursive=True))
+        if not paths:
+            raise FileNotFoundError(f"No episode archives found under {rollout_dir}")
+
+        self._episodes: list[dict] = []
+        self._index_map: list[tuple[int, int]] = []
+        for ep_idx, p in enumerate(paths):
+            ep = dict(np.load(p, allow_pickle=True))
+            self._episodes.append(ep)
+            T = len(ep["states"])
+            for t in range(T):
+                self._index_map.append((ep_idx, t))
+
+        self._action_horizon = action_horizon
+        logging.info(
+            f"RolloutNpzDataset: {len(paths)} episodes, "
+            f"{len(self._index_map)} frames, action_horizon={action_horizon}"
+        )
+
+    def __getitem__(self, index: SupportsIndex) -> dict:
+        idx = index.__index__() if hasattr(index, "__index__") else int(index)
+        ep_idx, t = self._index_map[idx]
+        ep = self._episodes[ep_idx]
+
+        T = len(ep["actions"])
+        action_chunk = np.stack(
+            [ep["actions"][min(t + dt, T - 1)] for dt in range(self._action_horizon)]
+        ).astype(np.float32)
+
+        return {
+            "image": np.asarray(ep["images"][t]),
+            "wrist_image": np.asarray(ep["wrist_images"][t]),
+            "state": np.asarray(ep["states"][t], dtype=np.float32),
+            "actions": action_chunk,
+            "prompt": str(ep["task_description"]),
+        }
+
+    def __len__(self) -> int:
+        return len(self._index_map)
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
     """Create a dataset for training."""
+    if getattr(data_config, "rollout_dir", None):
+        return RolloutNpzDataset(data_config.rollout_dir, action_horizon=action_horizon)
+
     repo_id = data_config.repo_id
     if repo_id is None:
         raise ValueError("Repo ID is not set. Cannot create dataset.")
@@ -172,12 +230,14 @@ def create_rlds_dataset(
 def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
     """Transform the dataset by applying the data transforms."""
     norm_stats = {}
-    if data_config.repo_id != "fake" and not skip_norm_stats:
+    is_real_lerobot = data_config.repo_id not in (None, "fake")
+    if is_real_lerobot and not skip_norm_stats:
         if data_config.norm_stats is None:
             raise ValueError(
                 "Normalization stats not found. "
                 "Make sure to run `scripts/compute_norm_stats.py --config-name=<your-config>`."
             )
+    if data_config.norm_stats is not None:
         norm_stats = data_config.norm_stats
 
     return TransformedDataset(
@@ -265,6 +325,7 @@ def create_data_loader(
         seed=config.seed,
         skip_norm_stats=skip_norm_stats,
         framework=framework,
+        advantages_path=getattr(config, "rwfm_advantages_path", None),
     )
 
 
@@ -281,6 +342,7 @@ def create_torch_data_loader(
     num_workers: int = 0,
     seed: int = 0,
     framework: str = "jax",
+    advantages_path: str | None = None,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -312,6 +374,12 @@ def create_torch_data_loader(
         logging.info(f"Few-shot dataset: {len(dataset)} frames from selected episodes")
 
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+
+    # ---- Inject precomputed advantages at the Dataset level (shuffle-safe) ----
+    if advantages_path is not None:
+        adv_data = np.load(advantages_path, allow_pickle=True)
+        dataset = AdvantageInjectorDataset(dataset, adv_data["advantages"])
+        logging.info(f"Injected advantages from {advantages_path} ({len(adv_data['advantages'])} values)")
 
     # Use TorchDataLoader for both frameworks
     # For PyTorch DDP, create DistributedSampler and divide batch size by world size
@@ -538,6 +606,34 @@ class RLDSDataLoader:
                 yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
 
 
+class AdvantageInjectorDataset(Dataset):
+    """Wraps a dataset and injects precomputed advantage values per sample.
+
+    The advantage value travels with each sample through shuffling / batching,
+    so the pairing is always correct regardless of data loader ordering.
+    """
+
+    def __init__(self, base_dataset: Dataset, advantages: np.ndarray):
+        self._dataset = base_dataset
+        self._advantages = advantages.astype(np.float32)
+        ds_len = len(self._dataset)
+        adv_len = len(self._advantages)
+        if adv_len < ds_len:
+            logging.warning(
+                f"Advantage array ({adv_len}) shorter than dataset ({ds_len}); "
+                "cycling advantage indices for excess samples."
+            )
+
+    def __getitem__(self, index: SupportsIndex):
+        sample = self._dataset[index]
+        idx = index.__index__() if hasattr(index, "__index__") else int(index)
+        sample["advantages"] = self._advantages[idx % len(self._advantages)]
+        return sample
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+
+
 class DataLoaderImpl(DataLoader):
     def __init__(self, data_config: _config.DataConfig, data_loader: TorchDataLoader | RLDSDataLoader):
         self._data_config = data_config
@@ -550,7 +646,7 @@ class DataLoaderImpl(DataLoader):
         for batch in self._data_loader:
             obs = _model.Observation.from_dict(batch)
             actions = batch["actions"]
-            if "advantages" in batch:
-                yield obs, actions, batch["advantages"]
-            else:
-                yield obs, actions
+            adv = batch.get("advantages", None)
+            if adv is not None:
+                adv = jnp.asarray(adv)
+            yield obs, actions, adv

@@ -96,6 +96,11 @@ class DataConfig:
     few_shot_episodes_per_task: int | None = None
     few_shot_seed: int = 42
 
+    # Path to rollout .npz directory.  When set, training data is loaded from
+    # episode archives produced by ``collect_libero_rollouts.py`` instead of a
+    # LeRobot dataset.  Mutually exclusive with ``repo_id``.
+    rollout_dir: str | None = None
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
@@ -355,6 +360,55 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         # We return all data transforms for training and inference. No need to change anything here.
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class RolloutLiberoDataConfig(DataConfigFactory):
+    """Creates a DataConfig that trains on rollout .npz episodes.
+
+    Applies the same LIBERO transforms (repack + LiberoInputs + DeltaActions +
+    model transforms) as ``LeRobotLiberoDataConfig``, but reads samples from the
+    rollout directory instead of a LeRobot HuggingFace dataset.
+    """
+
+    rollout_dir: str = ""
+    extra_delta_transform: bool = False
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "image",
+                        "observation/wrist_image": "wrist_image",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[libero_policy.LiberoInputs(model_type=model_config.model_type)],
+            outputs=[libero_policy.LiberoOutputs()],
+        )
+        if self.extra_delta_transform:
+            delta_action_mask = _transforms.make_bool_mask(6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+        model_transforms = ModelTransformFactory()(model_config)
+
+        base = self.create_base_config(assets_dirs, model_config)
+        return dataclasses.replace(
+            base,
+            rollout_dir=self.rollout_dir,
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
@@ -689,11 +743,7 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi0_libero_mixed_noise",
-        model=pi0_config.Pi0Config(
-            use_mixed_noise=True,
-            noise_mix_alpha=0.3,
-            noise_kl_weight=0.01,
-        ),
+        model=pi0_config.Pi0Config(),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
             base_config=DataConfig(prompt_from_task=True),
@@ -839,25 +889,25 @@ _CONFIGS = [
     ),
     #
     # RWFM RL fine-tuning from few-shot SFT checkpoint.
+    # Trains on rollout data (success + failure) with precomputed advantages.
     #
     TrainConfig(
         name="pi0_libero_rwfm",
         model=pi0_config.Pi0Config(),
-        data=LeRobotLiberoDataConfig(
-            repo_id="physical-intelligence/libero",
-            base_config=DataConfig(
-                prompt_from_task=True,
-            ),
+        data=RolloutLiberoDataConfig(
+            rollout_dir="/seu_share/home/linli/213221101/MyDatasets/data/libero/rollouts",
             extra_delta_transform=True,
+            assets=AssetsConfig(asset_id="physical-intelligence/libero"),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "{checkpoint_base_dir}/pi0_libero_fewshot/sft_seed/4999/params"
+            "/seu_share/home/linli/213221101/checkpoints/pi0_libero_fewshot/physical-intelligence/libero/4999/params"
         ),
-        num_train_steps=10_000,
+        num_train_steps=30_000,
+        save_interval=5000,
         rwfm_enabled=True,
         rwfm_beta=1.0,
         rwfm_noise_adaptive=True,
-        rwfm_advantages_path="data/libero/advantages.npz",
+        rwfm_advantages_path="/seu_share/home/linli/213221101/MyDatasets/data/libero/advantages.npz",
     ),
     #
     # Fine-tuning Aloha configs.
