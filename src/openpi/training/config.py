@@ -760,6 +760,9 @@ _CONFIGS = [
             use_mixed_noise=True,
             noise_mix_alpha=0.3,
             noise_kl_weight=0.01,
+            moe_num_experts=4,
+            moe_top_k=2,
+            moe_balance_weight=0.01,
         ),
         data=LeRobotLiberoDataConfig(
             repo_id="libero_fewshot_no_90",
@@ -768,9 +771,42 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "gs://openpi-assets/checkpoints/pi0_base/params",
-            extra_missing_regex=".*(shared_mu|shared_log_sigma|task_noise_hidden|task_noise_mu_head|task_noise_log_sigma_head).*",
+            extra_missing_regex=(
+                ".*(shared_mu|shared_log_sigma"
+                "|noise_router|noise_expert_hidden|noise_expert_mu|noise_expert_log_sigma).*"
+            ),
         ),
         num_train_steps=5000,
+        save_interval=5000,
+    ),
+        #
+    # MoE noise: mixed noise with Mixture-of-Experts task branch.
+    # Loads from SFT checkpoint; MoE-specific parameters (router + expert MLPs)
+    # are randomly initialised via extra_missing_regex.
+    #
+    TrainConfig(
+        name="pi0_libero_moe_noise",
+        model=pi0_config.Pi0Config(
+            use_mixed_noise=True,
+            noise_mix_alpha=0.3,
+            noise_kl_weight=0.01,
+            moe_num_experts=4,
+            moe_top_k=2,
+            moe_balance_weight=0.01,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi0_base/params",
+            extra_missing_regex=(
+                ".*(shared_mu|shared_log_sigma"
+                "|noise_router|noise_expert_hidden|noise_expert_mu|noise_expert_log_sigma).*"
+            ),
+        ),
+        num_train_steps=30_000,
         save_interval=5000,
     ),
     TrainConfig(

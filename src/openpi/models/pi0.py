@@ -103,14 +103,33 @@ class Pi0(_model.BaseModel):
         self.use_mixed_noise = config.use_mixed_noise
         self.noise_mix_alpha = config.noise_mix_alpha
         self.noise_kl_weight = config.noise_kl_weight
+        self.moe_num_experts = config.moe_num_experts
+        self.moe_top_k = config.moe_top_k
+        self.moe_balance_weight = config.moe_balance_weight
         if self.use_mixed_noise:
             self.shared_mu = nnx.Param(jnp.zeros((config.action_horizon, config.action_dim)))
             self.shared_log_sigma = nnx.Param(jnp.zeros((config.action_horizon, config.action_dim)))
-            noise_hidden_dim = config.noise_head_hidden_dim or action_expert_config.width
+            noise_hidden_dim = config.moe_hidden_dim or config.noise_head_hidden_dim or action_expert_config.width
             noise_out_dim = config.action_horizon * config.action_dim
-            self.task_noise_hidden = nnx.Linear(paligemma_config.width, noise_hidden_dim, rngs=rngs)
-            self.task_noise_mu_head = nnx.Linear(noise_hidden_dim, noise_out_dim, rngs=rngs)
-            self.task_noise_log_sigma_head = nnx.Linear(noise_hidden_dim, noise_out_dim, rngs=rngs)
+
+            if self.moe_num_experts > 1:
+                self.noise_router = nnx.Linear(paligemma_config.width, config.moe_num_experts, rngs=rngs)
+                self.noise_expert_hidden = nnx.List([
+                    nnx.Linear(paligemma_config.width, noise_hidden_dim, rngs=rngs)
+                    for _ in range(config.moe_num_experts)
+                ])
+                self.noise_expert_mu = nnx.List([
+                    nnx.Linear(noise_hidden_dim, noise_out_dim, rngs=rngs)
+                    for _ in range(config.moe_num_experts)
+                ])
+                self.noise_expert_log_sigma = nnx.List([
+                    nnx.Linear(noise_hidden_dim, noise_out_dim, rngs=rngs)
+                    for _ in range(config.moe_num_experts)
+                ])
+            else:
+                self.task_noise_hidden = nnx.Linear(paligemma_config.width, noise_hidden_dim, rngs=rngs)
+                self.task_noise_mu_head = nnx.Linear(noise_hidden_dim, noise_out_dim, rngs=rngs)
+                self.task_noise_log_sigma_head = nnx.Linear(noise_hidden_dim, noise_out_dim, rngs=rngs)
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -209,7 +228,7 @@ class Pi0(_model.BaseModel):
     def _predict_task_noise_params(
         self, task_emb: at.Float[at.Array, "b emb"]
     ) -> tuple[at.Float[at.Array, "b ah ad"], at.Float[at.Array, "b ah ad"]]:
-        """Predict per-task noise mean and log-std from language embedding."""
+        """Predict per-task noise mean and log-std from language embedding (single MLP fallback)."""
         h = nnx.swish(self.task_noise_hidden(task_emb))
         mu = self.task_noise_mu_head(h)
         log_sigma = self.task_noise_log_sigma_head(h)
@@ -217,6 +236,75 @@ class Pi0(_model.BaseModel):
         log_sigma = log_sigma.reshape(task_emb.shape[0], self.action_horizon, self.action_dim)
         log_sigma = jnp.clip(log_sigma, -2.0, 2.0)
         return mu, log_sigma
+
+    def _moe_top_k_route(
+        self, task_emb: at.Float[at.Array, "b emb"]
+    ) -> tuple[at.Float[at.Array, "b n"], at.Float[at.Array, "b n"]]:
+        """Top-k routing: returns (sparse_weights [B, N], router_logits [B, N])."""
+        logits = self.noise_router(task_emb)  # [B, N]
+        n = self.moe_num_experts
+        k = self.moe_top_k
+
+        top_k_values, top_k_indices = jax.lax.top_k(logits, k)  # [B, k]
+        top_k_weights = jax.nn.softmax(top_k_values, axis=-1)    # [B, k]
+
+        # Scatter into sparse weight matrix [B, N]
+        batch_size = task_emb.shape[0]
+        sparse_weights = jnp.zeros((batch_size, n))
+        batch_idx = jnp.arange(batch_size)[:, None]  # [B, 1]
+        sparse_weights = sparse_weights.at[batch_idx, top_k_indices].set(top_k_weights)
+
+        return sparse_weights, logits
+
+    def _predict_task_noise_params_moe(
+        self, task_emb: at.Float[at.Array, "b emb"]
+    ) -> tuple[
+        at.Float[at.Array, "b ah ad"],
+        at.Float[at.Array, "b ah ad"],
+        at.Float[at.Array, "b n"],
+        at.Float[at.Array, "b n"],
+        list,
+    ]:
+        """MoE version: returns (mu_task, log_sigma_task, sparse_weights, router_logits, per_expert_params)."""
+        sparse_weights, logits = self._moe_top_k_route(task_emb)  # [B, N], [B, N]
+        b = task_emb.shape[0]
+
+        all_mu = []
+        all_log_sigma = []
+        for i in range(self.moe_num_experts):
+            h_i = nnx.swish(self.noise_expert_hidden[i](task_emb))
+            mu_i = self.noise_expert_mu[i](h_i).reshape(b, self.action_horizon, self.action_dim)
+            ls_i = jnp.clip(
+                self.noise_expert_log_sigma[i](h_i).reshape(b, self.action_horizon, self.action_dim),
+                -2.0, 2.0,
+            )
+            all_mu.append(mu_i)
+            all_log_sigma.append(ls_i)
+
+        # Stack: [N, B, ah, ad] -> transpose to [B, N, ah, ad]
+        stacked_mu = jnp.stack(all_mu, axis=0).transpose(1, 0, 2, 3)          # [B, N, ah, ad]
+        stacked_log_sigma = jnp.stack(all_log_sigma, axis=0).transpose(1, 0, 2, 3)
+
+        w = sparse_weights[:, :, None, None]  # [B, N, 1, 1]
+        mu_task = jnp.sum(w * stacked_mu, axis=1)              # [B, ah, ad]
+        log_sigma_task = jnp.sum(w * stacked_log_sigma, axis=1)  # [B, ah, ad]
+
+        per_expert_params = list(zip(all_mu, all_log_sigma))
+
+        return mu_task, log_sigma_task, sparse_weights, logits, per_expert_params
+
+    def _compute_load_balance_loss(
+        self,
+        router_logits: at.Float[at.Array, "b n"],
+    ) -> at.Float[at.Array, ""]:
+        """Switch Transformer load balancing loss: L_bal = N * sum(f_i * p_i)."""
+        n = self.moe_num_experts
+        # f_i: fraction of samples where expert i is the top-1 choice
+        top1 = jnp.argmax(router_logits, axis=-1)  # [B]
+        f = jnp.mean(jax.nn.one_hot(top1, n), axis=0)  # [N]
+        # p_i: average router probability for expert i
+        p = jnp.mean(jax.nn.softmax(router_logits, axis=-1), axis=0)  # [N]
+        return n * jnp.sum(f * p)
 
     def _diagonal_kl_to_standard(
         self, mu: at.Array, log_sigma: at.Array
@@ -235,7 +323,14 @@ class Pi0(_model.BaseModel):
         eps_shared = self.shared_mu.value + sigma_s * jax.random.normal(rng_shared, shape)
 
         task_emb = self._get_task_emb(obs)
-        mu_k, log_sigma_k = self._predict_task_noise_params(task_emb)
+
+        if self.moe_num_experts > 1:
+            mu_k, log_sigma_k, sparse_weights, router_logits, per_expert_params = (
+                self._predict_task_noise_params_moe(task_emb)
+            )
+        else:
+            mu_k, log_sigma_k = self._predict_task_noise_params(task_emb)
+
         sigma_k = jnp.exp(log_sigma_k)
         eps_task = mu_k + sigma_k * jax.random.normal(rng_task, shape)
 
@@ -245,8 +340,21 @@ class Pi0(_model.BaseModel):
         kl_shared = self._diagonal_kl_to_standard(
             self.shared_mu.value, jnp.clip(self.shared_log_sigma.value, -2.0, 2.0)
         )
-        kl_task = self._diagonal_kl_to_standard(mu_k, log_sigma_k)
-        kl_loss = kl_shared + kl_task
+
+        if self.moe_num_experts > 1:
+            # Weighted KL over activated experts
+            kl_experts = []
+            for i, (mu_i, ls_i) in enumerate(per_expert_params):
+                kl_experts.append(self._diagonal_kl_to_standard(mu_i, ls_i))
+            kl_per_expert = jnp.stack(kl_experts)  # [N]
+            # Weight by average routing weight per expert across batch
+            avg_weights = jnp.mean(sparse_weights, axis=0)  # [N]
+            kl_task = jnp.sum(avg_weights * kl_per_expert)
+            balance_loss = self._compute_load_balance_loss(router_logits)
+            kl_loss = kl_shared + kl_task + self.moe_balance_weight * balance_loss
+        else:
+            kl_task = self._diagonal_kl_to_standard(mu_k, log_sigma_k)
+            kl_loss = kl_shared + kl_task
 
         return noise, kl_loss
 

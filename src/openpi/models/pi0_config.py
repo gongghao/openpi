@@ -41,6 +41,13 @@ class Pi0Config(_model.BaseModelConfig):
     noise_kl_weight: float = 0.01
     noise_head_hidden_dim: int | None = None
 
+    # MoE noise: replace the single task-noise MLP with N expert MLPs + router.
+    # Only active when use_mixed_noise=True and moe_num_experts > 1.
+    moe_num_experts: int = 1
+    moe_top_k: int = 2
+    moe_balance_weight: float = 0.01
+    moe_hidden_dim: int | None = None
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
