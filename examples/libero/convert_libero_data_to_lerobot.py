@@ -7,10 +7,11 @@ modified for any other data you have saved in a custom format.
 Usage:
 uv run examples/libero/convert_libero_data_to_lerobot.py --data_dir /path/to/your/data
 
-By default each distinct task (``language_instruction``) contributes at most 2 episodes
-**per RLDS suite** (each of spatial/goal/object/libero_10 has 10 tasks; once all 10 have
-enough episodes, scanning that suite stops early). Use ``--episodes-per-task 0`` to
-disable this cap and convert everything.
+Per RLDS suite, each task (``language_instruction``) keeps a configurable number of episodes:
+spatial / goal / object use **2** episodes per task; ``libero_10_no_noops`` uses **21** per task
+(see ``EPISODES_PER_TASK_BY_SUITE``). Once every task in a suite reaches its cap, scanning
+that suite stops early. Use ``--episodes-per-task-override 0`` to disable caps for **all**
+suites and convert everything.
 
 If you want to push your dataset to the Hugging Face Hub, you can use the following command:
 uv run examples/libero/convert_libero_data_to_lerobot.py --data_dir /path/to/your/data --push_to_hub
@@ -31,23 +32,28 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 import tensorflow_datasets as tfds
 import tyro
 
-REPO_NAME = "pi0_fewshot"  # Name of the output dataset, also used for the Hugging Face Hub
+REPO_NAME = "libero_fewshot_no_90"  # Name of the output dataset, also used for the Hugging Face Hub
 RAW_DATASET_NAMES = [
-    "libero_90_openvla_processed",
     "libero_spatial_no_noops",
     "libero_goal_no_noops",
     "libero_object_no_noops",
     "libero_10_no_noops",
 ]  # For simplicity we will combine multiple Libero datasets into one training dataset
 
-# LIBERO 中 spatial / goal / object / 10 每个 suite 均为 10 个任务；用于「配额已满」时提前结束扫描以加速。
-# 不在表中的 suite（如 libero_90_*）不提前结束，需扫完全部 episode（或由 episodes_per_task 跳过）。
+# LIBERO 中 spatial / goal / object / libero_10 每个 suite 均为 10 个任务；用于「配额已满」时提前结束扫描以加速。
 EXPECTED_TASKS_PER_SUITE: dict[str, int | None] = {
     "libero_spatial_no_noops": 10,
     "libero_goal_no_noops": 10,
     "libero_object_no_noops": 10,
     "libero_10_no_noops": 10,
-    "libero_90_openvla_processed": None,
+}
+
+# 每个 suite 内，每个 task 保留的 episode 数（按 language_instruction 区分 task）。
+EPISODES_PER_TASK_BY_SUITE: dict[str, int] = {
+    "libero_spatial_no_noops": 2,
+    "libero_goal_no_noops": 2,
+    "libero_object_no_noops": 2,
+    "libero_10_no_noops": 21,
 }
 
 
@@ -65,18 +71,26 @@ def _suite_fewshot_quota_reached(
     return all(v >= episodes_per_task for v in task_counts.values())
 
 
-def main(data_dir: str, *, push_to_hub: bool = False, episodes_per_task: int = 2):
+def main(
+    data_dir: str,
+    *,
+    push_to_hub: bool = False,
+    episodes_per_task_override: int | None = None,
+):
     """Convert RLDS episodes to LeRobot.
 
     Args:
         data_dir: RLDS data directory for tensorflow_datasets.
         push_to_hub: If True, push the result to the Hugging Face Hub.
-        episodes_per_task: Keep at most this many episodes per distinct task **within each
-            RLDS suite** (task = ``language_instruction`` string). ``0`` means no limit.
+        episodes_per_task_override: If set, use this cap for **every** suite (0 = unlimited).
+            If ``None``, use per-suite values in ``EPISODES_PER_TASK_BY_SUITE``.
     """
     print(f"[INFO] Start converting Libero RLDS -> LeRobot. data_dir={data_dir}")
     print(f"[INFO] Output repo_id={REPO_NAME}, push_to_hub={push_to_hub}")
-    print(f"[INFO] episodes_per_task={episodes_per_task} (0 = unlimited)")
+    if episodes_per_task_override is None:
+        print(f"[INFO] Per-suite episodes/task: {EPISODES_PER_TASK_BY_SUITE}")
+    else:
+        print(f"[INFO] episodes_per_task_override={episodes_per_task_override} (0 = unlimited, applies to all suites)")
 
     # Clean up any existing dataset in the output directory
     output_path = HF_LEROBOT_HOME / REPO_NAME
@@ -133,7 +147,14 @@ def main(data_dir: str, *, push_to_hub: bool = False, episodes_per_task: int = 2
     for raw_dataset_name in RAW_DATASET_NAMES:
         task_episode_counts: dict[str, int] = {}
         expected_tasks = EXPECTED_TASKS_PER_SUITE.get(raw_dataset_name)
-        print(f"[INFO] Loading dataset split: {raw_dataset_name}")
+        if episodes_per_task_override is not None:
+            episodes_per_task = episodes_per_task_override
+        else:
+            episodes_per_task = EPISODES_PER_TASK_BY_SUITE.get(raw_dataset_name, 2)
+        print(
+            f"[INFO] Loading dataset split: {raw_dataset_name} "
+            f"(episodes_per_task={episodes_per_task or '∞'} per task in this suite)"
+        )
         raw_dataset = tfds.load(raw_dataset_name, data_dir=data_dir, split="train")
         if tf is not None:
             try:
