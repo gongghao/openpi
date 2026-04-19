@@ -11,15 +11,21 @@ Usage:
         --sft-config pi0_libero_fewshot \
         --sft-checkpoint-dir /path/to/sft_checkpoint/4999 \
         --output-dir checkpoints/value_functions \
-        --num-steps 5000
+        --num-steps 5000 \
+        --log-interval 100
+
+Writes ``state_vf_metrics.jsonl`` and ``action_cond_vf_metrics.jsonl`` under ``--output-dir``
+(averaged loss every ``--log-interval`` steps, same idea as ``train.py``).
 """
 
 import dataclasses
 import glob
+import json
 import logging
 import pathlib
 
 import flax.nnx as nnx
+from flax.training import common_utils
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -50,10 +56,11 @@ class Args:
     batch_size: int = 64
     lr: float = 3e-4
     seed: int = 42
+    log_interval: int = 100
 
     hidden_dim: int = 256
     num_bins: int = 101
-    feature_batch_size: int = 8
+    feature_batch_size: int = 128
 
 
 # ---------------------------------------------------------------------------
@@ -202,8 +209,36 @@ def get_or_extract_features(
 # Training loops
 # ---------------------------------------------------------------------------
 
+def _write_metrics_row(metrics_path: pathlib.Path, step: int, reduced_info: dict) -> None:
+    row = {"step": int(step)}
+    for k, v in reduced_info.items():
+        row[k] = float(v)
+    with metrics_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        f.flush()
+
+
+def _flush_metrics_log(
+    pbar,
+    infos: list,
+    metrics_path: pathlib.Path,
+    step: int,
+) -> None:
+    if not infos:
+        return
+    stacked_infos = common_utils.stack_forest(infos)
+    reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
+    info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
+    pbar.write(f"Step {step}: {info_str}")
+    _write_metrics_row(metrics_path, step, reduced_info)
+
+
 def train_state_vf(
-    args: Args, dataset: dict, image_emb: np.ndarray, lang_emb: np.ndarray
+    args: Args,
+    dataset: dict,
+    image_emb: np.ndarray,
+    lang_emb: np.ndarray,
+    metrics_path: pathlib.Path,
 ) -> StateValueFunction:
     rng = jax.random.key(args.seed)
     n = dataset["states"].shape[0]
@@ -219,6 +254,7 @@ def train_state_vf(
     tx = optax.adam(args.lr)
     opt_state = tx.init(nnx.state(vf, nnx.Param))
 
+    infos: list = []
     pbar = tqdm.tqdm(range(args.num_steps), desc="StateVF")
     for step in pbar:
         rng, batch_rng = jax.random.split(rng)
@@ -235,14 +271,24 @@ def train_state_vf(
         new_params = optax.apply_updates(params, updates)
         nnx.update(vf, new_params)
 
+        infos.append({"loss": jnp.asarray(loss)})
+        if step % args.log_interval == 0:
+            _flush_metrics_log(pbar, infos, metrics_path, step)
+            infos = []
         if step % 200 == 0:
             pbar.set_postfix(loss=f"{float(loss):.4f}")
+
+    last_step = args.num_steps - 1
+    _flush_metrics_log(pbar, infos, metrics_path, last_step)
 
     return vf
 
 
 def train_action_conditioned_vf(
-    args: Args, dataset: dict, image_emb: np.ndarray
+    args: Args,
+    dataset: dict,
+    image_emb: np.ndarray,
+    metrics_path: pathlib.Path,
 ) -> ActionConditionedValueFunction:
     rng = jax.random.key(args.seed + 1)
     n = dataset["states"].shape[0]
@@ -259,6 +305,7 @@ def train_action_conditioned_vf(
     tx = optax.adam(args.lr)
     opt_state = tx.init(nnx.state(vf, nnx.Param))
 
+    infos: list = []
     pbar = tqdm.tqdm(range(args.num_steps), desc="ActionCondVF")
     for step in pbar:
         rng, batch_rng, noise_rng, time_rng = jax.random.split(rng, 4)
@@ -282,8 +329,15 @@ def train_action_conditioned_vf(
         new_params = optax.apply_updates(params, updates)
         nnx.update(vf, new_params)
 
+        infos.append({"loss": jnp.asarray(loss)})
+        if step % args.log_interval == 0:
+            _flush_metrics_log(pbar, infos, metrics_path, step)
+            infos = []
         if step % 200 == 0:
             pbar.set_postfix(loss=f"{float(loss):.4f}")
+
+    last_step = args.num_steps - 1
+    _flush_metrics_log(pbar, infos, metrics_path, last_step)
 
     return vf
 
@@ -307,15 +361,20 @@ def main(args: Args) -> None:
     image_emb, lang_emb = get_or_extract_features(args, episodes, n)
     logging.info(f"Feature shapes – image: {image_emb.shape}, lang: {lang_emb.shape}")
 
+    state_vf_metrics_path = out / "state_vf_metrics.jsonl"
+    action_cond_vf_metrics_path = out / "action_cond_vf_metrics.jsonl"
+    logging.info(f"Metrics (state VF): {state_vf_metrics_path}")
+    logging.info(f"Metrics (action-cond VF): {action_cond_vf_metrics_path}")
+
     logging.info("Training StateValueFunction …")
-    svf = train_state_vf(args, dataset, image_emb, lang_emb)
+    svf = train_state_vf(args, dataset, image_emb, lang_emb, state_vf_metrics_path)
     svf_path = out / "state_vf.nnx"
     svf_params = jax.tree.map(np.asarray, nnx.state(svf, nnx.Param).to_pure_dict())
     np.savez(svf_path, **{"/".join(k): v for k, v in jax.tree_util.tree_leaves_with_path(svf_params)})
     logging.info(f"StateVF saved to {svf_path}.npz")
 
     logging.info("Training ActionConditionedValueFunction …")
-    acvf = train_action_conditioned_vf(args, dataset, image_emb)
+    acvf = train_action_conditioned_vf(args, dataset, image_emb, action_cond_vf_metrics_path)
     acvf_path = out / "action_cond_vf.nnx"
     acvf_params = jax.tree.map(np.asarray, nnx.state(acvf, nnx.Param).to_pure_dict())
     np.savez(acvf_path, **{"/".join(k): v for k, v in jax.tree_util.tree_leaves_with_path(acvf_params)})

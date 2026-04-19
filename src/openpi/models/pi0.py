@@ -114,18 +114,24 @@ class Pi0(_model.BaseModel):
 
             if self.moe_num_experts > 1:
                 self.noise_router = nnx.Linear(paligemma_config.width, config.moe_num_experts, rngs=rngs)
-                self.noise_expert_hidden = nnx.List([
-                    nnx.Linear(paligemma_config.width, noise_hidden_dim, rngs=rngs)
-                    for _ in range(config.moe_num_experts)
-                ])
-                self.noise_expert_mu = nnx.List([
-                    nnx.Linear(noise_hidden_dim, noise_out_dim, rngs=rngs)
-                    for _ in range(config.moe_num_experts)
-                ])
-                self.noise_expert_log_sigma = nnx.List([
-                    nnx.Linear(noise_hidden_dim, noise_out_dim, rngs=rngs)
-                    for _ in range(config.moe_num_experts)
-                ])
+                # Named submodules per expert (not tuple/list): NNX uses int keys for sequences, which breaks
+                # flax.traverse_util.flatten_dict(..., sep="/") in weight_loaders._merge_params.
+                for i in range(config.moe_num_experts):
+                    setattr(
+                        self,
+                        f"noise_expert_hidden_{i}",
+                        nnx.Linear(paligemma_config.width, noise_hidden_dim, rngs=rngs),
+                    )
+                    setattr(
+                        self,
+                        f"noise_expert_mu_{i}",
+                        nnx.Linear(noise_hidden_dim, noise_out_dim, rngs=rngs),
+                    )
+                    setattr(
+                        self,
+                        f"noise_expert_log_sigma_{i}",
+                        nnx.Linear(noise_hidden_dim, noise_out_dim, rngs=rngs),
+                    )
             else:
                 self.task_noise_hidden = nnx.Linear(paligemma_config.width, noise_hidden_dim, rngs=rngs)
                 self.task_noise_mu_head = nnx.Linear(noise_hidden_dim, noise_out_dim, rngs=rngs)
@@ -272,11 +278,14 @@ class Pi0(_model.BaseModel):
         all_mu = []
         all_log_sigma = []
         for i in range(self.moe_num_experts):
-            h_i = nnx.swish(self.noise_expert_hidden[i](task_emb))
-            mu_i = self.noise_expert_mu[i](h_i).reshape(b, self.action_horizon, self.action_dim)
+            h_i = nnx.swish(getattr(self, f"noise_expert_hidden_{i}")(task_emb))
+            mu_i = getattr(self, f"noise_expert_mu_{i}")(h_i).reshape(b, self.action_horizon, self.action_dim)
             ls_i = jnp.clip(
-                self.noise_expert_log_sigma[i](h_i).reshape(b, self.action_horizon, self.action_dim),
-                -2.0, 2.0,
+                getattr(self, f"noise_expert_log_sigma_{i}")(h_i).reshape(
+                    b, self.action_horizon, self.action_dim
+                ),
+                -2.0,
+                2.0,
             )
             all_mu.append(mu_i)
             all_log_sigma.append(ls_i)

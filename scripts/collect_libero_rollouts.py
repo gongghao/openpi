@@ -39,8 +39,8 @@ C_FAIL = 200  # large penalty for failed episodes
 
 @dataclasses.dataclass
 class Checkpoint:
-    config: str = "pi0_libero_fewshot"
-    dir: str = "/seu_share/home/linli/213221101/checkpoints/pi0_libero_fewshot/physical-intelligence/libero/4999"
+    config: str = "pi0_libero_fewshot_mixed_noise"
+    dir: str = "/seu_share/home/linli/213221101/checkpoints/pi0_libero_fewshot_mixed_noise/libero_fewshot_no_90/4999"
 
 
 @dataclasses.dataclass
@@ -55,6 +55,14 @@ class Args:
 
     output_dir: str = "/seu_share/home/linli/213221101/MyDatasets/data/libero/rollouts"
     seed: int = 7
+
+    # Resume / checkpointing options.
+    # If set, reuse this sub-directory (e.g. "2026-04-07") instead of today's
+    # date — allowing the script to pick up a previously interrupted run.
+    archive_date: str | None = None
+    # If true, skip episodes whose output .npz already exists under the archive
+    # directory. Failed / success suffixes are both detected. Defaults to True.
+    resume: bool = True
 
 
 def _max_steps_for_suite(name: str) -> int:
@@ -105,6 +113,15 @@ def _get_libero_env(task, resolution, seed):
     return env, task_description
 
 
+def _find_existing_episode(task_dir: pathlib.Path, ep_idx: int) -> pathlib.Path | None:
+    """Return the path to an already-collected episode file if present."""
+    for suffix in ("success", "failure"):
+        p = task_dir / f"episode_{ep_idx:03d}_{suffix}.npz"
+        if p.exists():
+            return p
+    return None
+
+
 def _quat2axisangle(quat):
     quat = np.array(quat, copy=True)
     if quat[3] > 1.0:
@@ -126,10 +143,12 @@ def main(args: Args) -> None:
     logging.info("Policy loaded.")
 
     benchmark_dict = benchmark.get_benchmark_dict()
-    archive_date = date.today().isoformat()
+    archive_date = args.archive_date or date.today().isoformat()
     base_output = pathlib.Path(args.output_dir) / archive_date
+    logging.info(f"Archive directory: {base_output} (resume={args.resume})")
 
     grand_total, grand_success = 0, 0
+    grand_skipped = 0
 
     for suite_name in args.task_suite_names:
         max_steps = _max_steps_for_suite(suite_name)
@@ -138,19 +157,46 @@ def main(args: Args) -> None:
         logging.info(f"Suite: {suite_name} ({num_tasks} tasks)")
 
         suite_dir = base_output / suite_name
-        suite_total, suite_success = 0, 0
+        suite_total, suite_success, suite_skipped = 0, 0, 0
 
         for task_id in tqdm.tqdm(range(num_tasks), desc=f"{suite_name} tasks"):
             task = task_suite.get_task(task_id)
             initial_states = task_suite.get_task_init_states(task_id)
-            env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
 
+            task_description = task.language
             task_segment = task_description.replace(" ", "_").replace("/", "_")
             task_dir = suite_dir / f"task_{task_id:03d}_{task_segment}"
             task_dir.mkdir(parents=True, exist_ok=True)
 
+            # Resume: decide which episode indices still need to be run.
+            pending_idxs: list[int] = []
+            for ep_idx in range(args.num_trials_per_task):
+                existing = _find_existing_episode(task_dir, ep_idx) if args.resume else None
+                if existing is not None:
+                    suite_total += 1
+                    suite_skipped += 1
+                    # Count previously-collected successes toward the summary.
+                    try:
+                        with np.load(existing, allow_pickle=True) as data:
+                            if bool(np.asarray(data["success"]).item()):
+                                suite_success += 1
+                    except Exception as e:  # noqa: BLE001
+                        logging.warning(f"Failed to read {existing}: {e}")
+                else:
+                    pending_idxs.append(ep_idx)
+
+            if not pending_idxs:
+                logging.info(
+                    f"[resume] suite={suite_name} task={task_id}: all "
+                    f"{args.num_trials_per_task} episodes already collected, skipping env init."
+                )
+                continue
+
+            # Only create the LIBERO env if there is actual work left to do.
+            env, _ = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
+
             num_initial_states = len(initial_states)
-            for ep_idx in tqdm.tqdm(range(args.num_trials_per_task), leave=False):
+            for ep_idx in tqdm.tqdm(pending_idxs, leave=False, desc=f"task {task_id}"):
                 env.reset()
                 obs = env.set_init_state(initial_states[ep_idx % num_initial_states])
                 action_plan: collections.deque = collections.deque()
@@ -224,11 +270,18 @@ def main(args: Args) -> None:
                 if success:
                     suite_success += 1
 
-        logging.info(f"Suite '{suite_name}': {suite_success}/{suite_total} successes")
+        logging.info(
+            f"Suite '{suite_name}': {suite_success}/{suite_total} successes "
+            f"(skipped {suite_skipped} already-present episodes)"
+        )
         grand_total += suite_total
         grand_success += suite_success
+        grand_skipped += suite_skipped
 
-    logging.info(f"All suites: {grand_success}/{grand_total} ({grand_success/max(grand_total,1)*100:.1f}%)")
+    logging.info(
+        f"All suites: {grand_success}/{grand_total} ({grand_success/max(grand_total,1)*100:.1f}%), "
+        f"resumed/skipped {grand_skipped} existing episodes"
+    )
     logging.info(f"Data saved to {base_output}")
 
 
