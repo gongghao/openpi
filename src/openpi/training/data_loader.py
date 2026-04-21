@@ -1,3 +1,4 @@
+from collections import OrderedDict
 from collections.abc import Iterator, Sequence
 import logging
 import multiprocessing
@@ -15,6 +16,7 @@ import torch
 import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
+from openpi.training.rollout_manifest import RolloutManifest, build_manifest, load_manifest_from_npz
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
@@ -128,6 +130,25 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+def _resolve_rollout_dirs(data_config: _config.DataConfig) -> tuple[str, ...]:
+    """Return the ordered tuple of rollout directories defined on ``data_config``.
+
+    Supports the legacy single ``rollout_dir`` field plus (for B5 / B8) an
+    optional ``rollout_dirs`` collection. The concatenation order is the canon
+    used to build :class:`RolloutManifest` -- ``rollout_dir`` first (if set),
+    then each entry in ``rollout_dirs``.
+    """
+    dirs: list[str] = []
+    primary = getattr(data_config, "rollout_dir", None)
+    if primary:
+        dirs.append(str(primary))
+    extra = getattr(data_config, "rollout_dirs", None) or ()
+    for d in extra:
+        if d:
+            dirs.append(str(d))
+    return tuple(dirs)
+
+
 class RolloutNpzDataset:
     """Dataset that reads rollout episode .npz archives and yields per-frame
     samples in the same format as the LeRobot LIBERO dataset.
@@ -135,35 +156,73 @@ class RolloutNpzDataset:
     Each sample is a dict with:
         ``image``, ``wrist_image``, ``state``, ``actions``, ``prompt``
     which matches the keys expected by the LIBERO ``RepackTransform``.
+
+    The flattened frame order is defined by :class:`RolloutManifest` and must
+    exactly match the manifest used by ``precompute_advantages.py`` so that
+    ``advantages.npz`` is paired with the same dataset (enforced by
+    :class:`AdvantageInjectorDataset`).
     """
 
-    def __init__(self, rollout_dir: str, action_horizon: int = 50):
-        import glob as _glob
-
-        pattern = str(pathlib.Path(rollout_dir) / "**" / "episode_*.npz")
-        paths = sorted(_glob.glob(pattern, recursive=True))
-        if not paths:
-            raise FileNotFoundError(f"No episode archives found under {rollout_dir}")
-
-        self._episodes: list[dict] = []
-        self._index_map: list[tuple[int, int]] = []
-        for ep_idx, p in enumerate(paths):
-            ep = dict(np.load(p, allow_pickle=True))
-            self._episodes.append(ep)
-            T = len(ep["states"])
-            for t in range(T):
-                self._index_map.append((ep_idx, t))
-
+    def __init__(
+        self,
+        rollout_dir: str | Sequence[str],
+        action_horizon: int = 50,
+        *,
+        manifest: RolloutManifest | None = None,
+        cache_size: int = 32,
+    ):
+        self._manifest = manifest if manifest is not None else build_manifest(rollout_dir)
         self._action_horizon = action_horizon
+        # A2: LRU over materialized episode arrays. The collected rollouts are
+        # compressed ``.npz`` files, so ``mmap_mode`` cannot avoid decompression;
+        # we keep decompression cheap by holding only ``cache_size`` episodes in
+        # RAM at a time. DataLoader workers each get their own cache via
+        # pickling -- an empty one to start with.
+        self._cache_size = max(1, int(cache_size))
+        self._cache: OrderedDict[int, dict] = OrderedDict()
+
         logging.info(
-            f"RolloutNpzDataset: {len(paths)} episodes, "
-            f"{len(self._index_map)} frames, action_horizon={action_horizon}"
+            "RolloutNpzDataset: %d episodes, %d frames, action_horizon=%d, "
+            "manifest_sha=%s, cache_size=%d",
+            self._manifest.num_episodes,
+            self._manifest.num_frames,
+            action_horizon,
+            self._manifest.manifest_sha[:12],
+            self._cache_size,
         )
+
+    @property
+    def manifest(self) -> RolloutManifest:
+        return self._manifest
+
+    def _locate(self, idx: int) -> tuple[int, int]:
+        cum = self._manifest.cum_offsets
+        ep_idx = int(np.searchsorted(cum, idx, side="right") - 1)
+        return ep_idx, idx - int(cum[ep_idx])
+
+    def _load_episode(self, ep_idx: int) -> dict:
+        path = self._manifest.paths[ep_idx]
+        handle = np.load(path, mmap_mode="r", allow_pickle=True)
+        try:
+            return {k: handle[k] for k in handle.files}
+        finally:
+            handle.close()
+
+    def _get_episode(self, ep_idx: int) -> dict:
+        cached = self._cache.get(ep_idx)
+        if cached is not None:
+            self._cache.move_to_end(ep_idx)
+            return cached
+        ep = self._load_episode(ep_idx)
+        self._cache[ep_idx] = ep
+        while len(self._cache) > self._cache_size:
+            self._cache.popitem(last=False)
+        return ep
 
     def __getitem__(self, index: SupportsIndex) -> dict:
         idx = index.__index__() if hasattr(index, "__index__") else int(index)
-        ep_idx, t = self._index_map[idx]
-        ep = self._episodes[ep_idx]
+        ep_idx, t = self._locate(idx)
+        ep = self._get_episode(ep_idx)
 
         T = len(ep["actions"])
         action_chunk = np.stack(
@@ -179,15 +238,23 @@ class RolloutNpzDataset:
         }
 
     def __len__(self) -> int:
-        return len(self._index_map)
+        return self._manifest.num_frames
+
+    def __getstate__(self) -> dict:
+        # Reset the LRU when the dataset is pickled to a DataLoader worker so
+        # each process opens its own handles lazily.
+        state = self.__dict__.copy()
+        state["_cache"] = OrderedDict()
+        return state
 
 
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
     """Create a dataset for training."""
-    if getattr(data_config, "rollout_dir", None):
-        return RolloutNpzDataset(data_config.rollout_dir, action_horizon=action_horizon)
+    rollout_dirs = _resolve_rollout_dirs(data_config)
+    if rollout_dirs:
+        return RolloutNpzDataset(rollout_dirs, action_horizon=action_horizon)
 
     repo_id = data_config.repo_id
     if repo_id is None:
@@ -326,7 +393,59 @@ def create_data_loader(
         skip_norm_stats=skip_norm_stats,
         framework=framework,
         advantages_path=getattr(config, "rwfm_advantages_path", None),
+        per_enabled=getattr(config, "rwfm_per_enabled", False),
+        per_alpha=getattr(config, "rwfm_per_alpha", 1.0),
+        per_beta=getattr(config, "rwfm_per_beta", 1.0),
+        per_eps=getattr(config, "rwfm_per_eps", 1e-6),
+        rwfm_beta=getattr(config, "rwfm_beta", 1.0),
+        rwfm_adv_clip=getattr(config, "rwfm_adv_clip", 3.0),
     )
+
+
+def _compute_per_priorities(
+    advantages: np.ndarray,
+    *,
+    rwfm_beta: float,
+    rwfm_adv_clip: float,
+    per_alpha: float,
+    per_eps: float,
+) -> np.ndarray:
+    """B7: compute unnormalized priorities for ``WeightedRandomSampler``.
+
+    We approximate the per-batch RWFM weighting with a global variant:
+    clip the raw advantage to the A4 range, divide by ``rwfm_beta``, and
+    exponentiate. The ``per_alpha`` exponent controls sharpness --
+    ``alpha=1`` gives plain RWFM-proportional priorities, ``alpha<1``
+    smooths them toward uniform, ``alpha=0`` recovers uniform sampling.
+    """
+    adv = np.asarray(advantages, dtype=np.float64)
+    if rwfm_adv_clip > 0.0:
+        adv = np.clip(adv, -rwfm_adv_clip * rwfm_beta, rwfm_adv_clip * rwfm_beta)
+    weights = np.exp(adv / max(rwfm_beta, 1e-8))
+    weights = np.maximum(weights, 0.0) + float(per_eps)
+    if per_alpha != 1.0:
+        weights = np.power(weights, float(per_alpha))
+    return weights
+
+
+def _compute_per_importance_weights(
+    priorities: np.ndarray,
+    *,
+    per_beta: float,
+) -> np.ndarray:
+    """B7: IS correction ``((1 / (N * p_i)) / max_is) ** per_beta``.
+
+    Normalizing by ``max(is)`` keeps gradients from exploding on rare
+    high-priority samples, mirroring the original PER paper.
+    """
+    p = np.asarray(priorities, dtype=np.float64)
+    p = p / max(p.sum(), 1e-12)
+    n = len(p)
+    is_weights = 1.0 / (n * np.maximum(p, 1e-12))
+    is_weights = is_weights / max(is_weights.max(), 1e-12)
+    if per_beta != 1.0:
+        is_weights = np.power(is_weights, float(per_beta))
+    return is_weights.astype(np.float32)
 
 
 def create_torch_data_loader(
@@ -343,6 +462,12 @@ def create_torch_data_loader(
     seed: int = 0,
     framework: str = "jax",
     advantages_path: str | None = None,
+    per_enabled: bool = False,
+    per_alpha: float = 1.0,
+    per_beta: float = 1.0,
+    per_eps: float = 1e-6,
+    rwfm_beta: float = 1.0,
+    rwfm_adv_clip: float = 3.0,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -361,19 +486,69 @@ def create_torch_data_loader(
             execute in the main process.
         seed: The seed to use for shuffling the data.
     """
-    dataset = create_torch_dataset(data_config, action_horizon, model_config)
-    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+    raw_dataset = create_torch_dataset(data_config, action_horizon, model_config)
+    dataset = transform_dataset(raw_dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     # ---- Inject precomputed advantages at the Dataset level (shuffle-safe) ----
+    per_sampler: torch.utils.data.Sampler | None = None
     if advantages_path is not None:
         adv_data = np.load(advantages_path, allow_pickle=True)
-        dataset = AdvantageInjectorDataset(dataset, adv_data["advantages"])
-        logging.info(f"Injected advantages from {advantages_path} ({len(adv_data['advantages'])} values)")
+        dataset_manifest = getattr(raw_dataset, "manifest", None)
+        advantages_array = np.asarray(adv_data["advantages"], dtype=np.float32)
+
+        importance_weights: np.ndarray | None = None
+        if per_enabled:
+            # B7: offline prioritized sampling.
+            if framework == "pytorch" and torch.distributed.is_initialized():
+                logging.warning(
+                    "rwfm_per_enabled=True is not supported under torch.distributed; "
+                    "falling back to uniform DistributedSampler and unit IS weights."
+                )
+            else:
+                priorities = _compute_per_priorities(
+                    advantages_array,
+                    rwfm_beta=rwfm_beta,
+                    rwfm_adv_clip=rwfm_adv_clip,
+                    per_alpha=per_alpha,
+                    per_eps=per_eps,
+                )
+                importance_weights = _compute_per_importance_weights(priorities, per_beta=per_beta)
+                per_generator = torch.Generator()
+                per_generator.manual_seed(int(seed))
+                per_sampler = torch.utils.data.WeightedRandomSampler(
+                    weights=torch.as_tensor(priorities, dtype=torch.double),
+                    num_samples=len(dataset),
+                    replacement=True,
+                    generator=per_generator,
+                )
+                logging.info(
+                    "B7 prioritized sampling: N=%d alpha=%.3f per_beta=%.3f min_p=%.3e max_p=%.3e",
+                    len(priorities),
+                    per_alpha,
+                    per_beta,
+                    float(priorities.min() / max(priorities.sum(), 1e-12)),
+                    float(priorities.max() / max(priorities.sum(), 1e-12)),
+                )
+
+        dataset = AdvantageInjectorDataset(
+            dataset,
+            advantages_array,
+            expected_manifest=dataset_manifest,
+            advantages_manifest=load_manifest_from_npz(adv_data),
+            advantages_path=advantages_path,
+            importance_weights=importance_weights,
+        )
+        logging.info(
+            "Injected advantages from %s (%d values, PER=%s)",
+            advantages_path,
+            len(advantages_array),
+            "on" if importance_weights is not None else "off",
+        )
 
     # Use TorchDataLoader for both frameworks
     # For PyTorch DDP, create DistributedSampler and divide batch size by world size
     # For JAX, divide by process count
-    sampler = None
+    sampler: torch.utils.data.Sampler | None = None
     if framework == "pytorch":
         if torch.distributed.is_initialized():
             sampler = torch.utils.data.distributed.DistributedSampler(
@@ -388,6 +563,11 @@ def create_torch_data_loader(
             local_batch_size = batch_size
     else:
         local_batch_size = batch_size // jax.process_count()
+
+    # B7: prioritized sampler overrides shuffle=True for single-process training.
+    # Under DDP the distributed sampler wins (PER was already disabled above).
+    if per_sampler is not None and sampler is None:
+        sampler = per_sampler
 
     logging.info(f"local_batch_size: {local_batch_size}")
     data_loader = TorchDataLoader(
@@ -600,23 +780,62 @@ class AdvantageInjectorDataset(Dataset):
 
     The advantage value travels with each sample through shuffling / batching,
     so the pairing is always correct regardless of data loader ordering.
+
+    Strictness (A1): the advantage array must have exactly the same length as
+    the wrapped dataset. When a :class:`RolloutManifest` is available on both
+    sides, the ``manifest_sha`` must also match -- otherwise we refuse to run
+    because the rollout directory has diverged from the one
+    ``precompute_advantages.py`` scored.
     """
 
-    def __init__(self, base_dataset: Dataset, advantages: np.ndarray):
+    def __init__(
+        self,
+        base_dataset: Dataset,
+        advantages: np.ndarray,
+        *,
+        expected_manifest: RolloutManifest | None = None,
+        advantages_manifest: RolloutManifest | None = None,
+        advantages_path: str | None = None,
+        importance_weights: np.ndarray | None = None,
+    ):
         self._dataset = base_dataset
-        self._advantages = advantages.astype(np.float32)
+        self._advantages = np.asarray(advantages, dtype=np.float32)
+        self._importance_weights = (
+            np.asarray(importance_weights, dtype=np.float32) if importance_weights is not None else None
+        )
+
         ds_len = len(self._dataset)
         adv_len = len(self._advantages)
-        if adv_len < ds_len:
-            logging.warning(
-                f"Advantage array ({adv_len}) shorter than dataset ({ds_len}); "
-                "cycling advantage indices for excess samples."
+        if adv_len != ds_len:
+            raise ValueError(
+                f"Advantage array length ({adv_len}) != dataset length ({ds_len}). "
+                f"Re-run scripts/precompute_advantages.py against the current rollout "
+                f"directory so the two stay aligned"
+                + (f" (advantages file: {advantages_path})" if advantages_path else "")
+                + "."
             )
+        if self._importance_weights is not None and len(self._importance_weights) != ds_len:
+            raise ValueError(
+                f"importance_weights length ({len(self._importance_weights)}) != dataset length ({ds_len})."
+            )
+
+        if expected_manifest is not None and advantages_manifest is not None:
+            if expected_manifest.manifest_sha != advantages_manifest.manifest_sha:
+                raise ValueError(
+                    "manifest_sha mismatch between rollout dataset and advantages file: "
+                    f"dataset={expected_manifest.manifest_sha[:12]} "
+                    f"advantages={advantages_manifest.manifest_sha[:12]}"
+                    + (f" (file: {advantages_path})" if advantages_path else "")
+                    + ". The set or order of episode_*.npz files has changed; re-run "
+                    "scripts/precompute_advantages.py."
+                )
 
     def __getitem__(self, index: SupportsIndex):
         sample = self._dataset[index]
         idx = index.__index__() if hasattr(index, "__index__") else int(index)
-        sample["advantages"] = self._advantages[idx % len(self._advantages)]
+        sample["advantages"] = self._advantages[idx]
+        if self._importance_weights is not None:
+            sample["importance_weights"] = self._importance_weights[idx]
         return sample
 
     def __len__(self) -> int:
@@ -638,4 +857,7 @@ class DataLoaderImpl(DataLoader):
             adv = batch.get("advantages", None)
             if adv is not None:
                 adv = jnp.asarray(adv)
-            yield obs, actions, adv
+            is_w = batch.get("importance_weights", None)
+            if is_w is not None:
+                is_w = jnp.asarray(is_w)
+            yield obs, actions, adv, is_w

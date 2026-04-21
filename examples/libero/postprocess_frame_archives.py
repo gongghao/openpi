@@ -67,7 +67,19 @@ def main(args: Args) -> None:
             continue
 
         with np.load(archive_path) as data:
-            frames = data["frames"]
+            # Backward/forward compatibility:
+            # - eval archives usually store "frames"
+            # - rollout archives from RL pipeline store "images"
+            if "frames" in data:
+                frames = data["frames"]
+            elif "images" in data:
+                frames = data["images"]
+            else:
+                available_keys = ", ".join(sorted(data.files))
+                raise KeyError(
+                    f"Neither 'frames' nor 'images' found in archive: {archive_path}. "
+                    f"Available keys: [{available_keys}]"
+                )
             fps = int(data["fps"]) if "fps" in data else args.default_fps
 
         imageio.mimwrite(out_path, [np.asarray(frame) for frame in frames], fps=fps)

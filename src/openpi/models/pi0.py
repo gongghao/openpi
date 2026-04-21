@@ -63,6 +63,36 @@ def posemb_sincos(
     return jnp.concatenate([jnp.sin(sinusoid_input), jnp.cos(sinusoid_input)], axis=-1)
 
 
+def _normalize_advantages(adv: jnp.ndarray, mode: str, clip: float) -> jnp.ndarray:
+    """Per-batch advantage normalization shared by RWFM and A4.
+
+    ``zscore`` subtracts the batch mean and divides by the std (floor 1e-6).
+    ``rank`` maps values into [-1, 1] via argsort-of-argsort; robust to
+    outliers and to constant columns (e.g. demos batched with rollouts).
+    ``none`` returns the raw values.
+
+    Multi-host note: statistics are computed over the host-local batch shard.
+    Extending to multi-host would require ``jax.lax.pmean``; single-host today.
+    """
+    if mode == "none":
+        out = adv
+    elif mode == "zscore":
+        mean = jnp.mean(adv)
+        std = jnp.std(adv)
+        out = (adv - mean) / jnp.maximum(std, 1e-6)
+    elif mode == "rank":
+        order = jnp.argsort(adv)
+        ranks = jnp.argsort(order).astype(adv.dtype)
+        n = adv.shape[-1]
+        denom = jnp.maximum(float(n - 1), 1.0)
+        out = 2.0 * ranks / denom - 1.0
+    else:
+        raise ValueError(f"Unknown rwfm_adv_normalize mode: {mode!r}")
+    if clip > 0.0:
+        out = jnp.clip(out, -clip, clip)
+    return out
+
+
 class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
@@ -380,6 +410,9 @@ class Pi0(_model.BaseModel):
         advantages: at.Float[at.Array, " *b"] | None = None,
         rwfm_beta: float = 1.0,
         rwfm_noise_adaptive: bool = True,
+        rwfm_adv_normalize: str = "rank",
+        rwfm_adv_clip: float = 3.0,
+        importance_weights: at.Float[at.Array, " *b"] | None = None,
     ) -> at.Float[at.Array, "*b ah"]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
@@ -412,13 +445,23 @@ class Pi0(_model.BaseModel):
 
         fm_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)  # [*b, ah]
 
-        # RWFM: reweight flow-matching loss by exponentiated advantage
+        # RWFM: reweight flow-matching loss by exponentiated advantage.
+        # A4: normalize (zscore / rank / none) + optional symmetric clip before
+        # exp(A / beta) to tame tail blow-up and keep demos + rollouts
+        # comparable within a batch.
         if advantages is not None:
-            raw_w = jnp.exp(advantages / rwfm_beta)
+            adv_hat = _normalize_advantages(advantages, rwfm_adv_normalize, rwfm_adv_clip)
+            raw_w = jnp.exp(adv_hat / rwfm_beta)
             weights = raw_w / jnp.mean(raw_w)
             if rwfm_noise_adaptive:
                 weights = 1.0 + (1.0 - time) * (weights - 1.0)
             fm_loss = fm_loss * weights[..., None]
+
+        # B7: per-sample IS correction from offline prioritized sampling.
+        # Applied on top of the RWFM weighting so the batch still yields an
+        # unbiased estimator of ``E[w * L]`` under the prioritized proposal.
+        if importance_weights is not None:
+            fm_loss = fm_loss * importance_weights[..., None]
 
         if self.use_mixed_noise:
             kl_per_element = self.noise_kl_weight * kl_loss / max(fm_loss.size, 1)

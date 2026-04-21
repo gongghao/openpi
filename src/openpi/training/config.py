@@ -94,6 +94,10 @@ class DataConfig:
     # episode archives produced by ``collect_libero_rollouts.py`` instead of a
     # LeRobot dataset.  Mutually exclusive with ``repo_id``.
     rollout_dir: str | None = None
+    # B5 / B8: additional rollout directories to union with ``rollout_dir``.
+    # Concatenation order is ``rollout_dir`` first, then each entry here.
+    # Used for iterate-RWFM replay pools and demo npz union (Scheme B).
+    rollout_dirs: tuple[str, ...] = ()
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -370,6 +374,9 @@ class RolloutLiberoDataConfig(DataConfigFactory):
     """
 
     rollout_dir: str = ""
+    # B5 / B8: additional rollout directories to union with ``rollout_dir``
+    # (e.g. demo npz directory for Scheme B, or per-iteration rollouts).
+    rollout_dirs: tuple[str, ...] = ()
     extra_delta_transform: bool = False
 
     @override
@@ -403,6 +410,7 @@ class RolloutLiberoDataConfig(DataConfigFactory):
         return dataclasses.replace(
             base,
             rollout_dir=self.rollout_dir,
+            rollout_dirs=tuple(self.rollout_dirs),
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
@@ -593,6 +601,24 @@ class TrainConfig:
     rwfm_beta: float = 1.0
     rwfm_noise_adaptive: bool = True
     rwfm_advantages_path: str | None = None
+    # A4: how to normalize per-sample advantages before exp(A/beta). ``rank``
+    # (default) maps to [-1, 1] via argsort-of-argsort and is robust to outliers
+    # / constant columns, which matters once demos and rollouts share a batch.
+    # ``zscore`` subtracts batch mean and divides by std; ``none`` leaves raw.
+    rwfm_adv_normalize: Literal["none", "zscore", "rank"] = "rank"
+    # Symmetric clip applied after normalization. ``0.0`` disables clipping.
+    rwfm_adv_clip: float = 3.0
+
+    # B7: offline prioritized sampling (PER-style). When enabled, the torch
+    # loader samples frames with probability proportional to
+    # ``(exp(clip(A_i / beta, -clip, clip)) + eps) ** alpha`` and passes a
+    # per-sample importance weight ``((1 / (N * p_i)) / max_is) ** per_beta``
+    # into ``compute_loss`` so the estimator of the RWFM objective stays
+    # unbiased. Has no effect unless ``rwfm_advantages_path`` is also set.
+    rwfm_per_enabled: bool = False
+    rwfm_per_alpha: float = 1.0
+    rwfm_per_beta: float = 1.0
+    rwfm_per_eps: float = 1e-6
 
     @property
     def assets_dirs(self) -> pathlib.Path:

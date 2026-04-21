@@ -6,16 +6,27 @@ trained StateValueFunction **and** the cached encoder features produced by
 ``train_value_function.py``, then writes an advantage index file that the
 RWFM data loader can consume.
 
-Usage:
+Usage (single directory):
     python scripts/precompute_advantages.py \
         --rollout-dir data/libero/rollouts/2026-04-02 \
         --vf-path checkpoints/value_functions/state_vf.nnx.npz \
         --features-path checkpoints/value_functions/encoder_features.npz \
         --output-path data/libero/advantages.npz
+
+Usage (multiple directories — e.g. policy rollouts + demo npz union for B8):
+    python scripts/precompute_advantages.py \
+        --rollout-dirs data/libero/rollouts/iter0 data/libero/demos \
+        --vf-path .../state_vf.nnx.npz \
+        --features-path .../encoder_features.npz \
+        --output-path .../advantages.npz
+
+The emitted ``advantages.npz`` contains, in addition to per-frame values, the
+manifest fields ``manifest_sha`` / ``episode_paths`` / ``ep_lengths`` /
+``cum_offsets`` so that ``AdvantageInjectorDataset`` can refuse to run when
+the rollout directory has diverged from the one that was scored.
 """
 
 import dataclasses
-import glob
 import logging
 import pathlib
 import re
@@ -28,11 +39,20 @@ import numpy as np
 import tyro
 
 from openpi.models.value_function import StateValueFunction
+from openpi.training.rollout_manifest import (
+    RolloutManifest,
+    build_manifest,
+    load_manifest_from_npz,
+    manifest_npz_fields,
+)
 
 
 @dataclasses.dataclass
 class Args:
-    rollout_dir: str = "data/libero/rollouts"
+    # Single rollout directory. Use ``rollout_dirs`` instead when combining
+    # multiple sources (e.g. policy rollouts + demo npz for B8).
+    rollout_dir: str | None = None
+    rollout_dirs: tuple[str, ...] = ()
     vf_path: str = "checkpoints/value_functions/state_vf.nnx.npz"
     features_path: str = "checkpoints/value_functions/encoder_features.npz"
     output_path: str = "data/libero/advantages.npz"
@@ -43,34 +63,38 @@ class Args:
     seed: int = 42
 
 
-def load_rollout_frames(rollout_dir: str):
-    """Load all rollout episodes and flatten to frame-level arrays."""
-    pattern = str(pathlib.Path(rollout_dir) / "**" / "episode_*.npz")
-    paths = sorted(glob.glob(pattern, recursive=True))
-    logging.info(f"Found {len(paths)} episode archives")
+def _resolve_rollout_dirs(args: Args) -> tuple[str, ...]:
+    dirs: list[str] = []
+    if args.rollout_dir:
+        dirs.append(args.rollout_dir)
+    dirs.extend(d for d in args.rollout_dirs if d)
+    if not dirs:
+        raise ValueError("Specify at least one of --rollout-dir or --rollout-dirs.")
+    return tuple(dirs)
 
-    all_states, all_returns, all_sources = [], [], []
-    for p in paths:
+
+def load_rollout_frames(manifest: RolloutManifest) -> tuple[np.ndarray, np.ndarray]:
+    """Load all rollout episodes (in manifest order) and flatten to frame-level arrays."""
+    all_states: list[np.ndarray] = []
+    all_returns: list[np.ndarray] = []
+    for p in manifest.paths:
         data = dict(np.load(p, allow_pickle=True))
-        states = data["states"].astype(np.float32)
-        norm_ret = data["normalized_returns"].astype(np.float32)
-        all_states.append(states)
-        all_returns.append(norm_ret)
-        all_sources.extend([p] * len(states))
-
-    if not all_states:
-        raise FileNotFoundError(f"No episodes found under {rollout_dir}")
-
-    return (
-        np.concatenate(all_states, axis=0),
-        np.concatenate(all_returns, axis=0),
-        all_sources,
-    )
+        all_states.append(data["states"].astype(np.float32))
+        all_returns.append(data["normalized_returns"].astype(np.float32))
+    states = np.concatenate(all_states, axis=0)
+    returns = np.concatenate(all_returns, axis=0)
+    if states.shape[0] != manifest.num_frames:
+        raise RuntimeError(
+            f"Loaded {states.shape[0]} frames but manifest expects {manifest.num_frames}; "
+            "episode files have changed on disk mid-run."
+        )
+    return states, returns
 
 
 def _load_vf_params_from_npz(npz_path: str) -> dict:
     """Load flattened slash-key npz params and convert to nested pure dict."""
     data = np.load(npz_path, allow_pickle=True)
+
     def _clean_part(part: str) -> str:
         part = part.strip()
         m = re.fullmatch(r"\['(.+)'\]", part)
@@ -91,28 +115,43 @@ def _load_vf_params_from_npz(npz_path: str) -> dict:
     return traverse_util.unflatten_dict(flat)
 
 
-def load_encoder_features(features_path: str, num_frames: int):
-    """Load cached SigLIP / Gemma features produced by train_value_function.py."""
-    data = np.load(features_path)
+def load_encoder_features(features_path: str, manifest: RolloutManifest) -> tuple[np.ndarray, np.ndarray]:
+    """Load cached SigLIP / Gemma features and verify they match the manifest."""
+    data = np.load(features_path, allow_pickle=True)
     img = data["image_features"]
     lang = data["lang_features"]
-    if len(img) != num_frames:
+    if len(img) != manifest.num_frames:
         raise ValueError(
-            f"Feature file has {len(img)} frames but rollout data has {num_frames}. "
-            "Re-run train_value_function.py with the same rollout directory to refresh features."
+            f"Feature file has {len(img)} frames but manifest has {manifest.num_frames}. "
+            "Re-run train_value_function.py with the same --rollout-dir(s) to refresh features."
+        )
+    feat_manifest = load_manifest_from_npz(data)
+    if feat_manifest is not None and feat_manifest.manifest_sha != manifest.manifest_sha:
+        raise ValueError(
+            f"manifest_sha mismatch between feature cache ({feat_manifest.manifest_sha[:12]}) "
+            f"and rollout manifest ({manifest.manifest_sha[:12]}). "
+            f"Delete {features_path} or re-run train_value_function.py."
         )
     logging.info(f"Loaded encoder features from {features_path}  image={img.shape}  lang={lang.shape}")
     return img, lang
 
 
 def main(args: Args) -> None:
-    states, returns, sources = load_rollout_frames(args.rollout_dir)
-    n = states.shape[0]
-    logging.info(f"Total frames: {n}")
-    state_dim = int(states.shape[-1])
-    logging.info(f"Detected state_dim={state_dim} from rollout data")
+    rollout_dirs = _resolve_rollout_dirs(args)
+    manifest = build_manifest(rollout_dirs)
+    logging.info(
+        "Built rollout manifest: %d episodes, %d frames, manifest_sha=%s",
+        manifest.num_episodes,
+        manifest.num_frames,
+        manifest.manifest_sha[:12],
+    )
 
-    img_feats, lang_feats = load_encoder_features(args.features_path, n)
+    states, returns = load_rollout_frames(manifest)
+    n = states.shape[0]
+    state_dim = int(states.shape[-1])
+    logging.info(f"Total frames: {n}, detected state_dim={state_dim}")
+
+    img_feats, lang_feats = load_encoder_features(args.features_path, manifest)
     image_dim = int(img_feats.shape[-1])
     lang_dim = int(lang_feats.shape[-1])
 
@@ -147,7 +186,7 @@ def main(args: Args) -> None:
         out_path,
         advantages=advantages,
         returns=returns,
-        num_frames=np.array(n, dtype=np.int64),
+        **manifest_npz_fields(manifest),
     )
     logging.info(f"Advantages saved to {out_path}")
     logging.info(
