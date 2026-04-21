@@ -81,6 +81,7 @@ class Args:
     # Single rollout directory. Use ``rollout_dirs`` instead when combining
     # multiple sources (e.g. policy rollouts + demo npz for B8 / B5).
     rollout_dir: str = "/seu_share/home/linli/213221101/MyDatasets/data/libero/rollouts"
+    rollout_dirs: tuple[str, ...] = ()
     sft_config: str = "pi0_libero_fewshot"
     sft_checkpoint_dir: str = "/seu_share/home/linli/213221101/checkpoints/pi0_libero_fewshot/libero_fewshot_no_90/4999"
     output_dir: str = "checkpoints/value_functions"
@@ -117,7 +118,7 @@ def _resolve_rollout_dirs(args: Args) -> tuple[str, ...]:
     dirs: list[str] = []
     if args.rollout_dir:
         dirs.append(args.rollout_dir)
-    dirs.extend(d for d in args.rollout_dirs if d)
+    dirs.extend(d for d in getattr(args, "rollout_dirs", ()) if d)
     if not dirs:
         raise ValueError("Specify at least one of --rollout-dir or --rollout-dirs.")
     return tuple(dirs)
@@ -408,7 +409,9 @@ def _save_resume_state(
         "rng": _key_to_raw(rng),
         "num_steps": int(num_steps),
     }
-    buf = fser.msgpack_serialize(state)
+    # Use flax's high-level serializer so nested optax states (including tuples)
+    # are converted via to_state_dict before msgpack encoding.
+    buf = fser.to_bytes(state)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_bytes(buf)

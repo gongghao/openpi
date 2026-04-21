@@ -399,7 +399,72 @@ def create_data_loader(
         per_eps=getattr(config, "rwfm_per_eps", 1e-6),
         rwfm_beta=getattr(config, "rwfm_beta", 1.0),
         rwfm_adv_clip=getattr(config, "rwfm_adv_clip", 3.0),
+        rwfm_source_ratios=tuple(getattr(config, "rwfm_source_ratios", ()) or ()),
+        rwfm_source_dirs=tuple(getattr(config, "rwfm_source_dirs", ()) or ()),
     )
+
+
+def _build_source_weights(
+    source_dirs: Sequence[str],
+    source_ratios: Sequence[float],
+    *,
+    expected_num_frames: int,
+) -> np.ndarray:
+    """B9: per-frame sampling weights that realise the requested source ratios.
+
+    Builds one :class:`RolloutManifest` per source to count frames, then
+    assigns every frame in source ``i`` the weight
+    ``ratios[i] / max(num_frames_i, 1)``. Summing over all frames in a
+    source gives exactly ``ratios[i]``, so the
+    :class:`torch.utils.data.WeightedRandomSampler` that consumes these
+    weights draws each source with expected proportion ``ratios[i]``.
+
+    ``expected_num_frames`` is the concatenated manifest length used by the
+    wrapping :class:`RolloutNpzDataset`; we hard-fail on mismatch because a
+    divergent total invalidates the per-frame index mapping that
+    :class:`AdvantageInjectorDataset` relies on.
+    """
+    if len(source_dirs) != len(source_ratios):
+        raise ValueError(
+            f"rwfm_source_dirs ({len(source_dirs)}) and rwfm_source_ratios "
+            f"({len(source_ratios)}) must have the same length."
+        )
+    if not source_dirs:
+        raise ValueError("rwfm_source_dirs must contain at least one directory.")
+
+    frames_per_source: list[int] = []
+    for d in source_dirs:
+        manifest = build_manifest(d)
+        frames_per_source.append(int(manifest.num_frames))
+
+    total_frames = int(sum(frames_per_source))
+    if total_frames != expected_num_frames:
+        raise ValueError(
+            "rwfm_source_dirs frame counts do not match the concatenated "
+            f"RolloutNpzDataset: sum={total_frames} vs dataset={expected_num_frames}. "
+            "Ensure rwfm_source_dirs == [data.rollout_dir, *data.rollout_dirs]."
+        )
+
+    ratios = np.asarray(source_ratios, dtype=np.float64)
+    if float(ratios.sum()) <= 0:
+        raise ValueError(f"rwfm_source_ratios must have positive sum; got {source_ratios}")
+    ratios = ratios / ratios.sum()
+
+    weights = np.empty(total_frames, dtype=np.float64)
+    offset = 0
+    for n, r in zip(frames_per_source, ratios.tolist(), strict=True):
+        per_frame = float(r) / max(n, 1)
+        weights[offset : offset + n] = per_frame
+        offset += n
+
+    logging.info(
+        "B9 source-weighted sampling: sources=%d total_frames=%d ratios=%s frames=%s",
+        len(source_dirs),
+        total_frames,
+        tuple(round(float(r), 4) for r in ratios.tolist()),
+        tuple(frames_per_source),
+    )
+    return weights
 
 
 def _compute_per_priorities(
@@ -468,6 +533,8 @@ def create_torch_data_loader(
     per_eps: float = 1e-6,
     rwfm_beta: float = 1.0,
     rwfm_adv_clip: float = 3.0,
+    rwfm_source_ratios: Sequence[float] = (),
+    rwfm_source_dirs: Sequence[str] = (),
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -545,6 +612,32 @@ def create_torch_data_loader(
             "on" if importance_weights is not None else "off",
         )
 
+    # B9: three-source weighted sampler. Built from per-source manifest
+    # counts so it is robust to changes in ``data.rollout_dir`` /
+    # ``data.rollout_dirs`` between iterations, and overrides B7 PER when
+    # both are configured (we already pass advantages untouched).
+    b9_sampler: torch.utils.data.Sampler | None = None
+    if rwfm_source_ratios and rwfm_source_dirs:
+        if per_sampler is not None:
+            logging.warning(
+                "Both rwfm_per_enabled (B7) and rwfm_source_ratios (B9) are active; "
+                "B9 weighted sampler wins and B7 priorities are dropped."
+            )
+            per_sampler = None
+        b9_weights = _build_source_weights(
+            rwfm_source_dirs,
+            rwfm_source_ratios,
+            expected_num_frames=len(dataset),
+        )
+        b9_generator = torch.Generator()
+        b9_generator.manual_seed(int(seed) + 1_000_003)
+        b9_sampler = torch.utils.data.WeightedRandomSampler(
+            weights=torch.as_tensor(b9_weights, dtype=torch.double),
+            num_samples=len(dataset),
+            replacement=True,
+            generator=b9_generator,
+        )
+
     # Use TorchDataLoader for both frameworks
     # For PyTorch DDP, create DistributedSampler and divide batch size by world size
     # For JAX, divide by process count
@@ -559,14 +652,22 @@ def create_torch_data_loader(
                 drop_last=True,
             )
             local_batch_size = batch_size // torch.distributed.get_world_size()
+            if b9_sampler is not None:
+                logging.warning(
+                    "rwfm_source_ratios (B9) is not supported under torch.distributed; "
+                    "falling back to uniform DistributedSampler."
+                )
+                b9_sampler = None
         else:
             local_batch_size = batch_size
     else:
         local_batch_size = batch_size // jax.process_count()
 
-    # B7: prioritized sampler overrides shuffle=True for single-process training.
-    # Under DDP the distributed sampler wins (PER was already disabled above).
-    if per_sampler is not None and sampler is None:
+    # B9 weighted sampler takes precedence over B7 PER (both already
+    # reconciled above). Under DDP the distributed sampler wins.
+    if b9_sampler is not None and sampler is None:
+        sampler = b9_sampler
+    elif per_sampler is not None and sampler is None:
         sampler = per_sampler
 
     logging.info(f"local_batch_size: {local_batch_size}")

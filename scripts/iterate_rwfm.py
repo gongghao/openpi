@@ -142,6 +142,33 @@ class Args:
     replay_pool_size: int = 0  # 0 disables trimming (keeps everything).
     replay_pool_mode: Literal["fifo", "reservoir"] = "fifo"
 
+    # B9: Top-k filter + three-source ratio sampler.
+    # When ``topk_keep_ratio < 1.0`` every iteration runs
+    # ``scripts/filter_rollouts.py`` after collection and keeps only the
+    # top fraction (ranked by ``normalized_returns.mean()``) under
+    # ``iter_{k}/rollouts_topk/``. This filtered directory (not the raw
+    # ``rollouts/``) is what feeds the replay pool AND the VF / advantage /
+    # training stages, so low-quality episodes never pollute downstream
+    # artefacts.
+    topk_keep_ratio: float = 1.0
+    # If True, pass ``--min-success-floor`` to filter_rollouts.py so that
+    # every ``success=True`` episode is kept regardless of the top-k cut.
+    topk_min_success_floor: bool = True
+
+    # Optional demo directory (e.g. produced by
+    # ``scripts/export_libero_demos_to_npz.py``). When set, it is prepended
+    # to ``rollout_dirs`` for VF / advantage / training (canonical order is
+    # ``[demo, pool, topk]``), acting as a stable positive anchor that
+    # survives iterative retraining.
+    demo_dir: str = ""
+
+    # Per-source sampling ratios in the order ``[demo, pool, topk]``.
+    # Ratios for disabled sources (empty ``demo_dir`` / empty
+    # ``replay_pool_dir``) are dropped and the remaining entries are
+    # renormalised to sum to 1. When fewer than two sources are active
+    # the ratios are ignored and uniform sampling is used.
+    source_ratios: tuple[float, float, float] = (0.3, 0.4, 0.3)
+
     # RWFM training
     num_train_steps: int = 30_000
     batch_size: int = 32
@@ -181,19 +208,56 @@ def _rollout_dirs(
     extra: tuple[str, ...],
     *,
     replay_pool_dir: str = "",
+    demo_dir: str = "",
+    topk_enabled: bool = False,
 ) -> list[str]:
     """Manifest-order concatenation of directories consumed by VF / advantages / train.
 
-    When ``replay_pool_dir`` is set (B6 enabled), the pool REPLACES the
-    per-iter ``rollouts`` dir as the primary source: this guarantees the
-    manifest SHA is a deterministic function of the current pool contents,
-    so any files added / removed between stages are detected by
-    ``train_value_function`` and ``precompute_advantages``.
+    Canonical three-source order is ``[demo, pool, topk-or-raw]``:
+
+    * ``demo_dir`` (optional) always comes first so demo frames occupy the
+      leading index range of the global manifest.
+    * ``replay_pool_dir`` (optional) comes next. When set (B6 enabled) the
+      pool REPLACES the per-iter raw rollouts dir for this slot -- the
+      orchestrator has already synced fresh top-k episodes into it -- so
+      the manifest SHA is a pure function of current pool contents.
+    * The tail slot is ``iter_{k}/rollouts_topk`` when ``topk_enabled`` is
+      True (B9 filter ran this iteration), else ``iter_{k}/rollouts``.
+
+    ``extra`` is appended unchanged to preserve backward-compat callers.
     """
-    primary = replay_pool_dir if replay_pool_dir else str(iter_root / "rollouts")
-    dirs = [primary]
+    dirs: list[str] = []
+    if demo_dir:
+        dirs.append(demo_dir)
+    if replay_pool_dir:
+        dirs.append(replay_pool_dir)
+    tail = str(iter_root / ("rollouts_topk" if topk_enabled else "rollouts"))
+    dirs.append(tail)
     dirs.extend(d for d in extra if d)
     return dirs
+
+
+def _resolve_source_ratios(
+    ratios: tuple[float, float, float],
+    *,
+    demo_enabled: bool,
+    pool_enabled: bool,
+) -> tuple[float, ...]:
+    """Trim 3-tuple ``[demo, pool, topk]`` ratios down to active sources.
+
+    The returned tuple is renormalised to sum to 1. Disabled sources are
+    dropped silently. The trailing top-k slot is always enabled. When only
+    one source ends up active (no demo, no pool), an empty tuple is
+    returned to signal "uniform sampling" to the trainer.
+    """
+    mask = (demo_enabled, pool_enabled, True)
+    active = [r for r, m in zip(ratios, mask, strict=True) if m]
+    if len(active) <= 1:
+        return ()
+    total = float(sum(active))
+    if total <= 0:
+        raise ValueError(f"source_ratios must contain at least one positive entry; got {ratios}")
+    return tuple(float(r) / total for r in active)
 
 
 def _update_replay_pool(
@@ -328,6 +392,33 @@ def _stage_rollouts(args: Args, iter_root: pathlib.Path, policy_params_path: str
     _run(cmd, dry_run=args.dry_run)
 
 
+def _stage_topk_filter(args: Args, iter_root: pathlib.Path) -> None:
+    """Run ``scripts/filter_rollouts.py`` over this iteration's fresh rollouts.
+
+    Produces ``iter_{k}/rollouts_topk/`` which downstream stages use in
+    place of the raw ``rollouts/`` directory. No-op when
+    ``topk_keep_ratio >= 1.0``.
+    """
+    if args.topk_keep_ratio >= 1.0:
+        logging.info("top-k filter disabled (topk_keep_ratio=%.3f)", args.topk_keep_ratio)
+        return
+    cmd = [
+        args.python,
+        "scripts/filter_rollouts.py",
+        "--src-dir",
+        str(iter_root / "rollouts"),
+        "--dst-dir",
+        str(iter_root / "rollouts_topk"),
+        "--keep-ratio",
+        str(args.topk_keep_ratio),
+    ]
+    if args.topk_min_success_floor:
+        cmd.append("--min-success-floor")
+    else:
+        cmd.append("--no-min-success-floor")
+    _run(cmd, dry_run=args.dry_run)
+
+
 def _vf_dir(args: Args, iter_root: pathlib.Path) -> pathlib.Path:
     """Resolve the VF output directory.
 
@@ -393,16 +484,29 @@ def _build_train_inline_script(
     extra_rollout_dirs: tuple[str, ...],
     weight_params_path: str,
     adv_path: str,
+    source_ratios: tuple[float, ...],
+    source_dirs: tuple[str, ...],
 ) -> str:
     """Inline Python that builds a ``TrainConfig`` and calls ``train.main``.
 
     We go through ``dataclasses.replace`` rather than tyro overrides so that
     nested fields (``data.rollout_dir``, ``weight_loader.params_path``) are
     changed by value regardless of which tyro version the user has installed.
+
+    B9: when ``source_ratios`` is non-empty, ``rwfm_source_ratios`` /
+    ``rwfm_source_dirs`` are also injected into the config so the data
+    loader builds a ``WeightedRandomSampler`` matching the expected
+    per-source sampling proportions.
     """
     config_name = args.train_config_name
     exp_name = f"iter_{iter_k}"
     ckpt_base = str(iter_root / "rwfm_ckpt")
+    rwfm_sampler_lines = ""
+    if source_ratios:
+        rwfm_sampler_lines = (
+            f"\n            rwfm_source_ratios={tuple(source_ratios)!r},"
+            f"\n            rwfm_source_dirs={tuple(source_dirs)!r},"
+        )
     return textwrap.dedent(
         f"""
         import dataclasses
@@ -429,7 +533,7 @@ def _build_train_inline_script(
             num_train_steps={int(args.num_train_steps)},
             batch_size={int(args.batch_size)},
             rwfm_advantages_path={adv_path!r},
-            checkpoint_base_dir={ckpt_base!r},
+            checkpoint_base_dir={ckpt_base!r},{rwfm_sampler_lines}
         )
 
         ns = runpy.run_path(str(pathlib.Path("scripts/train.py")), run_name="__iter_rwfm__")
@@ -444,8 +548,15 @@ def _stage_train(
     iter_root: pathlib.Path,
     rollout_dirs: list[str],
     weight_params_path: str,
+    *,
+    source_ratios: tuple[float, ...],
 ) -> None:
     adv_path = str(iter_root / "advantages.npz")
+    # ``rwfm_source_dirs`` must match the canonical manifest order consumed
+    # by the data loader: ``[rollout_dir, *rollout_dirs]``. When ratios are
+    # active we pass exactly those as-is (extra unioned dirs included, the
+    # loader iterates them in the same order).
+    source_dirs = tuple(rollout_dirs) if source_ratios else ()
     code = _build_train_inline_script(
         args,
         iter_k,
@@ -454,6 +565,8 @@ def _stage_train(
         extra_rollout_dirs=tuple(rollout_dirs[1:]),
         weight_params_path=weight_params_path,
         adv_path=adv_path,
+        source_ratios=source_ratios,
+        source_dirs=source_dirs,
     )
     cmd = [args.python, "-c", code]
     pretty_args = {
@@ -462,6 +575,8 @@ def _stage_train(
         "advantages_path": adv_path,
         "exp_name": f"iter_{iter_k}",
         "checkpoint_base": str(iter_root / "rwfm_ckpt"),
+        "rwfm_source_ratios": source_ratios,
+        "rwfm_source_dirs": source_dirs,
     }
     logging.info(">>> train stage (inline): %s", pretty_args)
     if args.dry_run:
@@ -484,14 +599,20 @@ def main(args: Args) -> None:
 
         if "rollouts" in args.stages:
             _stage_rollouts(args, iter_root, policy_weights)
+            # B9: filter low-quality episodes before they reach the pool
+            # and the downstream VF / advantage / training stages.
+            _stage_topk_filter(args, iter_root)
 
-        # B6: sync freshly collected rollouts into the shared replay pool
-        # *before* downstream stages run, so the manifest they see already
-        # reflects the trimmed pool.
+        topk_enabled = args.topk_keep_ratio < 1.0
+
+        # B6 + B9: sync the *filtered* rollouts into the shared replay
+        # pool so only quality-gated episodes survive across iterations.
+        # When top-k is disabled this falls back to the raw rollouts.
+        pool_source = iter_root / ("rollouts_topk" if topk_enabled else "rollouts")
         if args.replay_pool_dir:
             pool_dir = pathlib.Path(args.replay_pool_dir).resolve()
             _update_replay_pool(
-                source_dir=iter_root / "rollouts",
+                source_dir=pool_source,
                 pool_dir=pool_dir,
                 max_size=args.replay_pool_size,
                 mode=args.replay_pool_mode,
@@ -503,6 +624,20 @@ def main(args: Args) -> None:
             iter_root,
             args.extra_rollout_dirs,
             replay_pool_dir=args.replay_pool_dir,
+            demo_dir=args.demo_dir,
+            topk_enabled=topk_enabled,
+        )
+
+        source_ratios = _resolve_source_ratios(
+            args.source_ratios,
+            demo_enabled=bool(args.demo_dir),
+            pool_enabled=bool(args.replay_pool_dir),
+        )
+        logging.info(
+            "rollout sources (|=%d, ratios=%s): %s",
+            len(rollout_dirs),
+            source_ratios if source_ratios else "uniform",
+            rollout_dirs,
         )
 
         if "vf" in args.stages:
@@ -510,7 +645,14 @@ def main(args: Args) -> None:
         if "advantages" in args.stages:
             _stage_advantages(args, iter_root, rollout_dirs)
         if "train" in args.stages:
-            _stage_train(args, k, iter_root, rollout_dirs, policy_weights)
+            _stage_train(
+                args,
+                k,
+                iter_root,
+                rollout_dirs,
+                policy_weights,
+                source_ratios=source_ratios,
+            )
 
 
 if __name__ == "__main__":

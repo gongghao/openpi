@@ -362,6 +362,112 @@ python scripts/iterate_rwfm.py \
 
 ---
 
+## 10.5 B9：入池 top-k + 三源配比采样
+
+### 目标与动机
+
+纯 B5/B6 在若干轮后会出现 **自训练漂移**：旧池被新数据稀释、低质量失败轨迹累积，导致回归式性能下降。B9 增加两层控制，同时保留已有的 RWFM/PER/replay-pool 通路。
+
+1. **入池门控（top-k 过滤）**：每轮 rollout 结束后，按 episode 的 `normalized_returns.mean()` 排序，只保留 top-k%（成功 + 高 return 失败都会被选中），其余不入池、不参与训练。
+2. **三来源配比采样**：训练阶段把 **demo 目录 / 历史池 / 本轮 top-k** 作为三段 concat 的 rollout 源交给 manifest，在 DataLoader 侧用 `WeightedRandomSampler` 让三段帧被采到的 **期望比例 = 30/40/30**（默认）。
+
+### 组件清单
+
+| 作用 | 文件 | 关键函数 / 字段 |
+| ---- | ---- | ---- |
+| 单轮 top-k 过滤脚本 | `scripts/filter_rollouts.py` | `--src-dir`, `--dst-dir`, `--keep-ratio`, `--min-success-floor` |
+| 迭代编排接入 | `scripts/iterate_rwfm.py` | `topk_keep_ratio`, `topk_min_success_floor`, `demo_dir`, `source_ratios`, `_stage_topk_filter`, `_resolve_source_ratios` |
+| 训练配置新字段 | `src/openpi/training/config.py` | `TrainConfig.rwfm_source_ratios`, `TrainConfig.rwfm_source_dirs` |
+| 权重采样器实现 | `src/openpi/training/data_loader.py` | `_build_source_weights`, B9 分支构造 `WeightedRandomSampler` |
+
+### 每轮目录布局
+
+```
+iter_{k}/
+  rollouts/           # 原始 rollout（永远保留，便于复查）
+  rollouts_topk/      # top-k 过滤后的副本（pool sync + VF/adv/train 实际消费）
+  vf/
+  advantages.npz
+  rwfm_ckpt/...
+```
+
+当 `topk_keep_ratio >= 1.0` 时 `rollouts_topk/` 不产生，流程回退到 B6 行为。
+
+### 数据流
+
+```mermaid
+flowchart LR
+  Collect["collect_libero_rollouts<br/>iter_k/rollouts"]
+  Filter["filter_rollouts.py<br/>top-k by normalized_return"]
+  TopK["iter_k/rollouts_topk"]
+  PoolSync["_update_replay_pool<br/>FIFO/reservoir"]
+  Pool["replay_pool_dir"]
+  Demo["demo_dir"]
+  VF["train_value_function"]
+  Adv["precompute_advantages"]
+  Train["train.py RWFM<br/>WeightedRandomSampler 30/40/30"]
+
+  Collect --> Filter --> TopK
+  TopK --> PoolSync --> Pool
+  Demo --> VF
+  Pool --> VF
+  TopK --> VF
+  VF --> Adv --> Train
+```
+
+三源 concat 顺序固定为 `[demo, pool, topk]`。`iterate_rwfm.py` 的 `_rollout_dirs` 按此顺序构造，disable 的源会被丢弃并自动重新归一化比例（`_resolve_source_ratios`）。
+
+### 运行命令
+
+```bash
+python scripts/iterate_rwfm.py \
+  --base-dir data/libero/rwfm_iters_topk \
+  --sft-config pi0_libero_fewshot \
+  --sft-checkpoint-dir /path/to/checkpoints/pi0_libero_fewshot/physical-intelligence/libero/4999 \
+  --train-config-name pi0_libero_rwfm \
+  --num-iters 4 \
+  --replay-pool-dir data/libero/replay_pool_topk \
+  --replay-pool-size 4000 \
+  --replay-pool-mode fifo \
+  --topk-keep-ratio 0.5 \
+  --demo-dir /path/to/exported_demos \
+  --source-ratios 0.3 0.4 0.3
+```
+
+参数约定：
+
+- `--topk-keep-ratio 1.0` 关闭 B9 入池过滤（保持旧行为）。
+- `--no-topk-min-success-floor` 禁用“所有 success=True 必留”，改为纯分数 top-k。
+- `--demo-dir ""` 关闭 demo 源，比例自动降为 `[pool, topk]`。
+- `--replay-pool-dir ""` 关闭历史池，比例自动降为 `[demo, topk]` 或仅 `[topk]`。
+- 只剩一个源时 `rwfm_source_ratios` 自动清空，回退到均匀采样（shuffle）。
+
+### 采样器语义
+
+`_build_source_weights` 为每个源目录单独构造 `RolloutManifest` 拿到帧数 `n_i`，再给该源内每帧赋权 `ratios[i] / max(n_i, 1)`，因此：
+
+- **期望比例** 严格等于 `ratios`（不受各源大小差异影响）。
+- **批内波动** 遵循多项分布；以 `batch=32` + `(0.3, 0.4, 0.3)` 为例每类 std 约 2~3 帧，属可接受范围。
+- `WeightedRandomSampler` 以 `replacement=True` 采样；同一帧可被多次采到，但在大数据集上概率很低。
+- 与 `AdvantageInjectorDataset` 完全兼容：advantage 按 **全局 index** 索引，采样顺序不影响对齐。
+- **DDP 兼容性**：若 `torch.distributed` 已初始化，`DistributedSampler` 优先，B9 采样器降级并告警；与 PER 同时开启时 B9 胜出，PER 被禁用并告警。
+
+### 推荐默认
+
+- `topk_keep_ratio = 0.5`
+- `source_ratios = (0.3, 0.4, 0.3)`
+- `replay_pool_size ≈ 3 × 单轮 topk 后 episode 数`（保持池占主导）
+- `rwfm_beta = 1.5 ~ 2.0`（配合 top-k 保守一些避免采样 + advantage 双重尖锐化）
+
+### 回滚与验证
+
+1. **干跑目录**：`--dry-run` 下 `_stage_topk_filter` 也被跳过，可先核对三源目录和 inline 脚本注入参数。
+2. **小规模冒烟**：`--num-trials-per-task 2 --num-train-steps 200` 跑一轮，确认 `rollouts_topk/` 生成、manifest SHA 一致、训练日志中出现 `B9 source-weighted sampling: ...`。
+3. **回滚策略**：保留 `iter_{k-1}/rwfm_ckpt/`，若某轮验证下降，直接 `--start-iter k-1 --num-iters 1` 重跑该轮，或改小 `topk_keep_ratio`。
+4. **encoder_features 缓存**：三源目录 / 池 / top-k 任一变化都会改变 `manifest_sha`，`train_value_function.py` 与 `precompute_advantages.py` 会强制重算，无需手工清缓存。
+
+---
+
 ## 11. 变更索引（按职责）
 
 - Manifest 与一致性：`src/openpi/training/rollout_manifest.py`
@@ -371,7 +477,8 @@ python scripts/iterate_rwfm.py \
 - 训练入口：`scripts/train.py`
 - VF 训练：`scripts/train_value_function.py`
 - Advantage 预计算：`scripts/precompute_advantages.py`
-- 迭代编排（B5/B6）：`scripts/iterate_rwfm.py`
+- 迭代编排（B5/B6/B9）：`scripts/iterate_rwfm.py`
+- Top-k 过滤（B9）：`scripts/filter_rollouts.py`
 
 本文档以当前仓库实现为准；若后续修改这些文件，请同步更新本说明。
 

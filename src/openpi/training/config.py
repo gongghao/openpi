@@ -620,6 +620,20 @@ class TrainConfig:
     rwfm_per_beta: float = 1.0
     rwfm_per_eps: float = 1e-6
 
+    # B9: three-source sampling ratios. When ``rwfm_source_ratios`` is set,
+    # the torch data loader builds a ``WeightedRandomSampler`` whose
+    # per-frame weight makes the expected sampling proportion of each
+    # source match the given ratio. Source order must match the manifest
+    # concatenation order, i.e. ``[data.rollout_dir, *data.rollout_dirs]``.
+    # ``rwfm_source_dirs`` lists the same directories (redundantly) so the
+    # loader can build a per-source manifest without re-deriving them from
+    # ``DataConfig``; mismatched lengths are a hard error. Leaving these
+    # empty preserves uniform sampling and is B9's off-switch. Mutually
+    # exclusive with ``rwfm_per_enabled`` -- B9 always wins when both are
+    # set (a warning is logged in the loader).
+    rwfm_source_ratios: tuple[float, ...] = ()
+    rwfm_source_dirs: tuple[str, ...] = ()
+
     @property
     def assets_dirs(self) -> pathlib.Path:
         """Get the assets directory for this config."""
